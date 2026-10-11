@@ -1,0 +1,29 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+jobs:
+  test:
+    name: 类型检查 + 测试
+    runs-on: ubuntu-latest
+    steps:
+      - name: 检出代码
+        uses: actions/checkout@v4
+
+      - name: 安装 Bun
+        uses: oven-sh/setup-bun@v2
+        with:
+          bun-version: latest
+
+      - name: 安装类型检查依赖（types/ 子目录）
+        working-directory: types
+        run: bun install --frozen-lockfile
+
+      - name: 类型检查（strict + noUnusedLocals）
+        run: bun run typecheck
+
+      - name: 测试（单元 + mock iLink + Bridge 行为）
+        run: bun test

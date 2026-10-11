@@ -1,5 +1,10 @@
 # opencode-wechat-cockpit · 微信驾驶舱
 
+[![CI](https://github.com/evilqin/opencode-wechat-cockpit/actions/workflows/ci.yml/badge.svg)](https://github.com/evilqin/opencode-wechat-cockpit/actions/workflows/ci.yml)
+[![License: MIT](https://img.shields.io/badge/License-MIT-blue.svg)](LICENSE)
+
+**中文** | [English](README.en.md)
+
 用微信遥控这台电脑上的 opencode：手机上发消息、发图，opencode 干活，结果回到微信。
 
 不需要公网 IP、不需要内网穿透、不需要装 OpenClaw。手机和腾讯服务器通信，这台电脑上的
