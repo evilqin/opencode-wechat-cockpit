@@ -1,0 +1,16 @@
+# 依赖：类型检查用（体积很大，克隆后 `cd types && bun install` 即可重建）
+types/node_modules/
+
+# 运行时文件：本插件的状态、日志、凭据永远不放进仓库
+*.log
+state.json
+lock.json
+qr.png
+config.json
+.env
+
+# 编辑器 / 系统
+.DS_Store
+Thumbs.db
+.idea/
+.vscode/

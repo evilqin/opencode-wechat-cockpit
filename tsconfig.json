@@ -1,0 +1,25 @@
+{
+  "compilerOptions": {
+    "target": "ES2023",
+    "lib": ["ES2023", "DOM"],
+    "module": "ESNext",
+    "moduleResolution": "bundler",
+    "allowImportingTsExtensions": true,
+    "resolveJsonModule": true,
+    "noEmit": true,
+    "strict": true,
+    "noUnusedLocals": true,
+    "noUnusedParameters": true,
+    "noUncheckedIndexedAccess": false,
+    "skipLibCheck": true,
+    "forceConsistentCasingInFileNames": true,
+    "typeRoots": ["./types/node_modules/@types"],
+    "types": ["bun"],
+    "baseUrl": ".",
+    "paths": {
+      "@opencode/plugin": ["./types/node_modules/@opencode/plugin/dist/promise/index.d.ts"]
+    }
+  },
+  "include": ["*.ts", "tests/**/*.ts", "types/*.d.ts"],
+  "exclude": ["types/node_modules"]
+}

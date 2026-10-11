@@ -1,0 +1,11 @@
+{
+  "private": true,
+  "description": "Type-checking only. Installed in a subdirectory so the plugin runtime never resolves these packages — the plugin must use the host's copies.",
+  "dependencies": {
+    "@opencode/plugin": "2.0.26"
+  },
+  "devDependencies": {
+    "typescript": "^5.8.0",
+    "@types/bun": "latest"
+  }
+}

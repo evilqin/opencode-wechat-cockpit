@@ -1,0 +1,33 @@
+{
+  "name": "opencode-wechat-cockpit",
+  "version": "1.3.0",
+  "private": true,
+  "type": "module",
+  "description": "微信驾驶舱：用手机微信遥控本机 opencode —— 会话、审批、提问、附件、主动推送，带单轮询器自愈与完整测试",
+  "license": "MIT",
+  "author": "evilqin",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/evilqin/opencode-wechat-cockpit.git"
+  },
+  "keywords": [
+    "opencode",
+    "opencode-plugin",
+    "wechat",
+    "weixin",
+    "ilink",
+    "clawbot",
+    "agent-bridge"
+  ],
+  "main": "index.ts",
+  "exports": {
+    ".": "./index.ts"
+  },
+  "scripts": {
+    "test": "bun test",
+    "typecheck": "node ./types/node_modules/typescript/bin/tsc -p tsconfig.json",
+    "verify": "bun verify.ts",
+    "login": "bun login-cli.ts",
+    "manual": "bun gen-manual.ts"
+  }
+}
