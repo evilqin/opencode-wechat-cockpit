@@ -26,4 +26,10 @@ jobs:
         run: bun run typecheck
 
       - name: 测试（单元 + mock iLink + Bridge 行为）
-        run: bun test
+        # 显式给出临时路径：不依赖 bun 的 preload 行为，也不会碰到任何真实凭据
+        env:
+          WECHAT_STATE_DIR: ${{ runner.temp }}/wechat-test-state
+          WECHAT_SERVICE_FILE: ${{ runner.temp }}/wechat-test-state/service.json
+        run: |
+          mkdir -p "$WECHAT_STATE_DIR"
+          bun test

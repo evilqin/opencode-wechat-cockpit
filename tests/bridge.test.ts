@@ -16,7 +16,9 @@
 
 import { afterAll, beforeAll, beforeEach, describe, expect, test } from "bun:test"
 import { createServer, type IncomingMessage, type Server } from "node:http"
-import { rmSync, writeFileSync } from "node:fs"
+import { mkdtempSync, rmSync, writeFileSync } from "node:fs"
+import { tmpdir } from "node:os"
+import { join } from "node:path"
 
 import { Bridge } from "../bridge.ts"
 import { LocalApi } from "../api.ts"
@@ -310,12 +312,20 @@ function makeContext(calls: Calls, sessions = new Map<string, Record<string, unk
 const ilink = await startILink()
 const apiMock = await startApi()
 
-// A registration file for the plugin client to read, written where the preload
-// pointed `WECHAT_SERVICE_FILE` (tests must never reach the real service).
-writeFileSync(
-  process.env.WECHAT_SERVICE_FILE!,
-  JSON.stringify({ url: apiMock.url, pid: process.pid, password: "test-password" }),
-)
+/**
+ * Paths this suite writes to.
+ *
+ * The preload normally sets both variables, but bun decides the file order per
+ * platform and a later suite's cleanup must not be able to empty them — so the
+ * values (and temp-dir fallbacks) are captured once, here, at import time.
+ */
+const TEST_SERVICE_FILE =
+  process.env.WECHAT_SERVICE_FILE ?? join(mkdtempSync(join(tmpdir(), "wechat-service-")), "service.json")
+const TEST_STATE_DIR = process.env.WECHAT_STATE_DIR ?? mkdtempSync(join(tmpdir(), "wechat-state-"))
+
+// A registration file for the plugin client to read (tests must never reach the
+// real service).
+writeFileSync(TEST_SERVICE_FILE, JSON.stringify({ url: apiMock.url, pid: process.pid, password: "test-password" }))
 
 const CONVERSATION = "bot@im.bot:user@im.wechat"
 
@@ -359,7 +369,7 @@ async function harness(overrides: Partial<WechatConfig> = {}, options: { keepSta
     config,
     { info: (message) => logs.push(`info ${message}`), warn: (message) => logs.push(`warn ${message}`) },
     "/tmp",
-    new LocalApi({ file: process.env.WECHAT_SERVICE_FILE, cacheMs: 0, timeoutMs: 2_000 }),
+    new LocalApi({ file: TEST_SERVICE_FILE, cacheMs: 0, timeoutMs: 2_000 }),
   )
   bridge.reloadState()
 
@@ -414,7 +424,7 @@ beforeEach(() => {
 afterAll(() => {
   ilink.server.close()
   apiMock.server.close()
-  rmSync(process.env.WECHAT_SERVICE_FILE!, { force: true })
+  rmSync(TEST_SERVICE_FILE, { force: true })
 })
 
 /* ------------------------------------------------------------------ tests -- */
@@ -567,8 +577,8 @@ describe("commands", () => {
     expect(sentTexts()[0]).toContain("新会话已就绪")
 
     clearSent()
-    await bridge.handleInbound(inbound(`/new ${process.env.WECHAT_STATE_DIR}`))
-    expect(calls.creates[1].location).toEqual({ directory: process.env.WECHAT_STATE_DIR })
+    await bridge.handleInbound(inbound(`/new ${TEST_STATE_DIR}`))
+    expect(calls.creates[1].location).toEqual({ directory: TEST_STATE_DIR })
     expect(sentTexts()[0]).toContain("新会话已就绪")
   })
 
@@ -753,9 +763,9 @@ describe("commands", () => {
     expect(sentTexts()[0]).toContain("目录不存在")
 
     clearSent()
-    await bridge.handleInbound(inbound(`/dir ${process.env.WECHAT_STATE_DIR}`))
+    await bridge.handleInbound(inbound(`/dir ${TEST_STATE_DIR}`))
     expect(sentTexts()[0]).toContain("默认目录已设为")
-    expect(readState().defaultDirectory).toBe(process.env.WECHAT_STATE_DIR)
+    expect(readState().defaultDirectory).toBe(TEST_STATE_DIR)
   })
 
   test("/status, /whoami, /ping and /log answer without the agent", async () => {

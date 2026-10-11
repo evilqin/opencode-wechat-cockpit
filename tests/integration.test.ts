@@ -444,6 +444,10 @@ describe("local api", () => {
   let apiUrl = ""
   let sawAuth: string | undefined
   let registrationFile = ""
+  // Whatever the preload set (or nothing): put it back exactly. bun runs every
+  // test file in one process and bridge.test.ts reads the variable at import
+  // time, so a `delete` here can break a suite that loads later.
+  const previousServiceFile = process.env.WECHAT_SERVICE_FILE
   let replyCount = 0
 
   beforeAll(async () => {
@@ -534,7 +538,8 @@ describe("local api", () => {
 
   afterAll(() => {
     apiServer.close()
-    delete process.env.WECHAT_SERVICE_FILE
+    if (previousServiceFile === undefined) delete process.env.WECHAT_SERVICE_FILE
+    else process.env.WECHAT_SERVICE_FILE = previousServiceFile
     rmSync(registrationFile, { force: true })
   })
 
