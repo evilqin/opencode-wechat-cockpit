@@ -10,7 +10,7 @@
 
 import { describe, expect, test } from "bun:test"
 
-import { chunkText, renderForWechat } from "../bridge.ts"
+import { chunkText, isResumeGap, renderForWechat } from "../bridge.ts"
 import { aesEcbPaddedSize, decodeKey, decryptAesEcb, encryptAesEcb, kindForPath, mimeForPath } from "../media.ts"
 import { normalizeConfig, configChanged, DEFAULT_CONFIG } from "../config.ts"
 import { parseDecision, parseSelector } from "../permissions.ts"
@@ -23,7 +23,7 @@ import {
   unwrapData,
   unwrapList,
 } from "../sessions.ts"
-import { conversationKey } from "../monitor.ts"
+import { ChannelMonitor, conversationKey } from "../monitor.ts"
 import { buildMediaRef, parseWireJson, newClientId, assertSendAccepted, SendRefusedError } from "../ilink.ts"
 import { LOCK_PATH, acquireLock, ensureStateDir } from "../state.ts"
 import { randomBytes } from "node:crypto"
@@ -418,5 +418,71 @@ describe("poller lock", () => {
     const handle = acquireLock("test")
     expect(handle).toBeDefined()
     handle?.release()
+  })
+})
+
+/*
+ * ---------------------------------------------------------------------------
+ * Network watchdog
+ * ---------------------------------------------------------------------------
+ */
+
+describe("network watchdog", () => {
+  test("a maintenance tick only counts as a resume after a long gap", () => {
+    const now = Date.now()
+    expect(isResumeGap(0, now)).toBe(false)
+    expect(isResumeGap(now - 10_000, now)).toBe(false)
+    expect(isResumeGap(now - 5 * 60_000, now)).toBe(true)
+  })
+
+  test("polls that never get an answer are reported, and recovery is noticed", async () => {
+    // A server that accepts the request and then says nothing: exactly what a
+    // portal that logged out, or a stale NAT entry, leaves behind.
+    const { createServer } = await import("node:http")
+    let mode: "hang" | "answer" = "hang"
+    const server = createServer((_request, response) => {
+      if (mode === "hang") return
+      response.writeHead(200, { "content-type": "application/json" })
+      response.end(JSON.stringify({ ret: 0, msgs: [] }))
+    })
+    await new Promise<void>((resolve) => {
+      server.listen(0, "127.0.0.1", () => resolve())
+    })
+    const address = server.address()
+    const port = typeof address === "object" && address ? address.port : 0
+
+    const timeouts: number[] = []
+    let recovered = 0
+    const monitor = new ChannelMonitor({
+      account: { accountId: "bot@im.bot", token: "token", baseUrl: `http://127.0.0.1:${port}` },
+      onMessage: async () => {},
+      initialTimeoutMs: 30,
+      timeoutGraceMs: 20,
+      onTimeout: (consecutive) => {
+        timeouts.push(consecutive)
+      },
+      onRecovered: () => {
+        recovered += 1
+      },
+    })
+
+    const controller = new AbortController()
+    const running = monitor.run(controller.signal)
+
+    await new Promise((resolve) => setTimeout(resolve, 250))
+    expect(timeouts.length).toBeGreaterThanOrEqual(2)
+    expect(timeouts[0]).toBe(1)
+    expect(monitor.consecutiveTimeouts).toBeGreaterThanOrEqual(2)
+
+    mode = "answer"
+    await new Promise((resolve) => setTimeout(resolve, 300))
+    controller.abort()
+    await running
+
+    expect(recovered).toBeGreaterThanOrEqual(1)
+    expect(monitor.consecutiveTimeouts).toBe(0)
+    const closeable = server as unknown as { closeAllConnections?: () => void }
+    closeable.closeAllConnections?.()
+    server.close()
   })
 })

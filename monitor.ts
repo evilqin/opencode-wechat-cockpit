@@ -71,6 +71,23 @@ export interface MonitorOptions {
    * stops by itself instead of delivering every message a second time.
    */
   shouldContinue?: () => boolean
+  /**
+   * Called when a poll ended by client-side timeout instead of an answer.
+   *
+   * A healthy long poll is always answered — the server's own timeout is
+   * shorter than the client's budget — so a timeout means the request was sent
+   * and nothing came back. That is what a logged-out portal, a stale NAT entry
+   * or a Wi-Fi link that only looks connected leaves behind, and it is
+   * invisible otherwise: the loop keeps cycling, nothing is logged, and the
+   * channel simply goes quiet.
+   */
+  onTimeout?: (consecutive: number) => void
+  /** Called when a real answer arrives after one or more timeouts. */
+  onRecovered?: (timeouts: number) => void
+  /** Initial long-poll budget; a server suggestion replaces it. Tests use this. */
+  initialTimeoutMs?: number
+  /** How long the client waits past the server's suggestion. Tests use this. */
+  timeoutGraceMs?: number
 }
 
 export class ChannelMonitor {
@@ -81,10 +98,15 @@ export class ChannelMonitor {
   #pausedUntil = 0
   /** When the last long poll came back, for the poller watchdog. */
   #lastActivityAt = Date.now()
+  /** Consecutive polls that ended by client-side timeout. */
+  #consecutiveTimeouts = 0
+  /** When a real answer last arrived; timeouts deliberately do not update it. */
+  #lastResponseAt = Date.now()
 
   constructor(options: MonitorOptions) {
     this.#options = options
     this.#syncBuf = options.initialSyncBuf ?? ""
+    if (options.initialTimeoutMs) this.#longPollTimeoutMs = options.initialTimeoutMs
   }
 
   /**
@@ -97,6 +119,21 @@ export class ChannelMonitor {
    */
   get lastActivityAt(): number {
     return this.#lastActivityAt
+  }
+
+  /**
+   * Consecutive polls that never got an answer.
+   *
+   * Non-zero means the path is dropping traffic: the requests leave, nothing
+   * comes back, and only the client budget ends the cycle.
+   */
+  get consecutiveTimeouts(): number {
+    return this.#consecutiveTimeouts
+  }
+
+  /** When the last poll was answered by the server. */
+  get lastResponseAt(): number {
+    return this.#lastResponseAt
   }
 
   get syncBuf(): string {
@@ -189,9 +226,9 @@ export class ChannelMonitor {
 
   async #getUpdates(account: WeixinAccount, signal: AbortSignal): Promise<GetUpdatesResp> {
     // Client budget exceeds the server's suggestion so the server returns first.
-    const timeoutMs = this.#longPollTimeoutMs + 5_000
+    const timeoutMs = this.#longPollTimeoutMs + (this.#options.timeoutGraceMs ?? 5_000)
     try {
-      return await apiCall<GetUpdatesResp>({
+      const response = await apiCall<GetUpdatesResp>({
         baseUrl: account.baseUrl,
         endpoint: "ilink/bot/getupdates",
         body: { get_updates_buf: this.#syncBuf, base_info: baseInfo() },
@@ -199,13 +236,27 @@ export class ChannelMonitor {
         timeoutMs,
         signal,
       })
+      return this.#markResponded(response)
     } catch (error) {
-      // A held request we stopped waiting on is a normal empty tick.
+      // Our own budget ran out: the request was sent and nothing answered.
       if (error instanceof Error && error.name === "AbortError" && !signal.aborted) {
+        this.#consecutiveTimeouts += 1
+        this.#options.onTimeout?.(this.#consecutiveTimeouts)
         return { ret: 0, msgs: [], get_updates_buf: this.#syncBuf }
       }
       throw error
     }
+  }
+
+  /** Record a real answer and report the end of a timeout streak. */
+  #markResponded(response: GetUpdatesResp): GetUpdatesResp {
+    this.#lastResponseAt = Date.now()
+    if (this.#consecutiveTimeouts > 0) {
+      const timeouts = this.#consecutiveTimeouts
+      this.#consecutiveTimeouts = 0
+      this.#options.onRecovered?.(timeouts)
+    }
+    return response
   }
 
   #failureDelay(): number {

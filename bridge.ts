@@ -88,6 +88,14 @@ const OWNERSHIP_CHECK_MS = 10_000
 const POLL_STALL_MS = 120_000
 /** Errcode used for failures that never reached the service. */
 const LOCAL_FAILURE = -1
+/** Consecutive long polls with no answer before the network is called out in the log. */
+const POLL_TIMEOUT_WARN_AFTER = 2
+/** Consecutive long polls with no answer before the poller is rebuilt. */
+const POLL_TIMEOUT_RESTART_AFTER = 3
+/** Minimum spacing between timeout-driven poller rebuilds. */
+const POLL_RESTART_COOLDOWN_MS = 5 * 60_000
+/** A maintenance tick this late means the process was suspended (lid, standby). */
+const SUSPENSION_GAP_MS = 60_000
 /** Inbound text beyond this is truncated for the prompt, with a note. */
 const MAX_INBOUND_CHARS = 8_000
 /** How much of the log `/log` prints. */
@@ -159,6 +167,10 @@ export class Bridge {
   #lastListing = new Map<string, string[]>()
   #retryTimers = new Map<string, NodeJS.Timeout>()
   #stopMonitor?: () => void
+  /** When the poller was last rebuilt because polls stopped being answered. */
+  #lastPollRestart = 0
+  /** Previous ownership tick, to notice that the process was suspended. */
+  #lastTickAt = 0
 
   constructor(ctx: Context, config: WechatConfig, log: Logger, location: string, api: LocalApi) {
     this.#ctx = ctx
@@ -262,6 +274,15 @@ export class Bridge {
         this.releaseOwnership()
         return
       }
+      // A tick that arrives this late means the process was suspended (lid
+      // closed, connected standby): the held poll is meaningless by now, so
+      // rebuild it instead of waiting for the socket to notice.
+      const tickedAt = Date.now()
+      if (isResumeGap(this.#lastTickAt, tickedAt)) {
+        this.#log.info(`resumed after a ${Math.round((tickedAt - this.#lastTickAt) / 1000)}s gap; rebuilding the poller`)
+        this.stopPolling({ restart: true })
+      }
+      this.#lastTickAt = tickedAt
       // A login may have landed after this instance started: pick it up.
       this.startPolling()
       // Watchdog: a held long poll that never returns leaves the loop alive and
@@ -383,6 +404,8 @@ export class Bridge {
       },
       onMessage: (message) => this.handleInbound(message),
       onError: (error) => this.#log.warn(`poll: ${errorText(error)}`),
+      onTimeout: (consecutive) => this.#handlePollTimeout(consecutive),
+      onRecovered: (timeouts) => this.#log.info(`poll answers resumed after ${timeouts} timeout(s)`),
       shouldContinue: () => this.ownsPoller,
       onStop: (reason, detail) => {
         this.#log.warn(`poll stopped: ${reason}${detail ? ` (${detail})` : ""}`)
@@ -408,6 +431,29 @@ export class Bridge {
    * where this instance keeps owning the slot and discarding buffered answers
    * or pending questions would lose work for no reason.
    */
+  /**
+   * A long poll was sent and nothing came back within the client budget.
+   *
+   * A healthy poll is always answered — the server's own timeout is shorter
+   * than ours — so a timeout means the path is dropping traffic (a portal that
+   * logged out, a stale NAT entry, a Wi-Fi link that only looks connected).
+   * Without this, the channel just goes quiet: the loop keeps cycling, no error
+   * is raised, and the stall watchdog sees "activity" in every silent timeout.
+   * After a few of those, rebuild the poller: a fresh socket recovers states a
+   * held connection cannot.
+   */
+  #handlePollTimeout(consecutive: number): void {
+    if (consecutive === POLL_TIMEOUT_WARN_AFTER) {
+      this.#log.warn(`${consecutive} long polls got no answer; the network may be dropping traffic`)
+    }
+    if (consecutive < POLL_TIMEOUT_RESTART_AFTER) return
+    if (Date.now() - this.#lastPollRestart < POLL_RESTART_COOLDOWN_MS) return
+    this.#lastPollRestart = Date.now()
+    this.#log.warn(`rebuilding the poller after ${consecutive} polls with no answer`)
+    this.stopPolling({ restart: true })
+    this.startPolling()
+  }
+
   stopPolling(options: { restart?: boolean } = {}): void {
     this.#stopMonitor?.()
     this.#stopMonitor = undefined
@@ -1637,6 +1683,7 @@ export class Bridge {
       `机器人：${account?.accountId ?? "未登录"}${account && !account.token ? "（token 已失效，需重新登录）" : ""}`,
       `绑定微信：${account?.userId ?? "未知"}`,
       `游标：${this.#state.syncBuf ? "已保存" : "无"}`,
+      `网络：${this.#describeNetwork()}`,
       `默认目录：${this.#defaultDirectory()}`,
       `进度提示：${this.#config.progress === "tools" ? "显示工具调用" : "关闭"}`,
       `回复延迟：文本结束后最多等 ${this.#config.turnGraceMs} 毫秒（grace）`,
@@ -1648,6 +1695,14 @@ export class Bridge {
       `本地 API：${this.#api.available ? (this.#api.isSelf ? "可用（本进程）" : "可用（注册文件指向其它进程）") : "不可用"}`,
     ]
     return lines.join("\n")
+  }
+
+  /** Health of the long-poll path, for `/status`. */
+  #describeNetwork(): string {
+    if (!this.#monitor) return "轮询器未运行"
+    const silentFor = Math.max(0, Math.round((Date.now() - this.#monitor.lastResponseAt) / 1000))
+    if (this.#monitor.consecutiveTimeouts === 0) return `正常（上次应答 ${silentFor} 秒前）`
+    return `${this.#monitor.consecutiveTimeouts} 次长轮询无应答（最后应答 ${silentFor} 秒前）`
   }
 
   #logTail(lines: number): string {
@@ -2492,4 +2547,9 @@ export function conversationIdOf(message: InboundMessage): string {
 
 export function errorText(error: unknown): string {
   return error instanceof Error ? error.message : String(error)
+}
+
+/** True when a maintenance tick arrived so late that the process was suspended. */
+export function isResumeGap(previousTick: number, now: number): boolean {
+  return previousTick > 0 && now - previousTick > SUSPENSION_GAP_MS
 }
