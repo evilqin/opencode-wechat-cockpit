@@ -10,7 +10,7 @@
 
 import { describe, expect, test } from "bun:test"
 
-import { chunkText, isResumeGap, renderForWechat } from "../bridge.ts"
+import { chunkText, isResumeGap, numberChunks, renderForWechat } from "../bridge.ts"
 import { aesEcbPaddedSize, decodeKey, decryptAesEcb, encryptAesEcb, kindForPath, mimeForPath } from "../media.ts"
 import { normalizeConfig, configChanged, DEFAULT_CONFIG } from "../config.ts"
 import { parseDecision, parseSelector } from "../permissions.ts"
@@ -49,6 +49,24 @@ describe("chunkText", () => {
     expect(rejoined).toEqual(lines)
   })
 
+  test("hard-splits a single line that is longer than the limit", () => {
+    // A minified blob or a paragraph with no spaces cannot be split on a line
+    // boundary; without a hard cut the whole thing goes out as one oversized
+    // message and the phone loses its tail.
+    const line = "x".repeat(1000)
+    const chunks = chunkText(line, 300)
+    expect(chunks.length).toBeGreaterThan(1)
+    expect(chunks.every((chunk) => chunk.length <= 300)).toBe(true)
+    expect(chunks.join("").replace(/\n/g, "")).toBe(line)
+  })
+
+  test("prefers a break near the cut", () => {
+    const text = `${"a".repeat(250)} ${"b".repeat(250)}`
+    const chunks = chunkText(text, 300)
+    expect(chunks.every((chunk) => chunk.length <= 300)).toBe(true)
+    expect(chunks[0]!.endsWith(" ")).toBe(true)
+  })
+
   test("closes and reopens code fences when splitting inside one", () => {
     const body = Array.from({ length: 60 }, (_, index) => `const x${index} = ${index}`).join("\n")
     const text = ["before", "```ts", body, "```", "after"].join("\n")
@@ -58,6 +76,16 @@ describe("chunkText", () => {
       const fences = chunk.split("\n").filter((line) => line.trim().startsWith("```")).length
       expect(fences % 2).toBe(0)
     }
+  })
+})
+
+describe("numberChunks", () => {
+  test("leaves a single part alone", () => {
+    expect(numberChunks(["only"])).toEqual(["only"])
+  })
+
+  test("numbers every part of a multi-part reply", () => {
+    expect(numberChunks(["a", "b", "c"])).toEqual(["（1/3）\na", "（2/3）\nb", "（3/3）\nc"])
   })
 })
 

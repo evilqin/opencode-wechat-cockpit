@@ -841,14 +841,76 @@ describe("commands", () => {
     clearSent()
     await bridge.handleInbound(inbound("/queue"))
     const texts = sentTexts()
-    expect(texts[0]).toBe("发不出去的内容")
-    expect(texts[1]).toContain("没有待发消息")
+    // The notice explains the gap, then the stuck answer itself arrives.
+    expect(texts[0]).toContain("没发完")
+    expect(texts[1]).toBe("发不出去的内容")
+    expect(texts[2]).toContain("没有待发消息")
 
     clearSent()
     ilink.refuseSends = true
     await bridge.handleInbound(inbound("再试一次"))
     expect(sentTexts().length).toBe(0)
     ilink.refuseSends = false
+  })
+
+  test("/more delivers stuck text without bothering the model", async () => {
+    const { bridge, calls } = await harness()
+    await bridge.handleInbound(inbound("/new 我的会话"))
+    const promptsBefore = calls.prompts.length
+
+    // The window is shut: the answer is queued, with a notice in front of it.
+    ilink.refuseSends = true
+    await bridge.handleEvent({
+      type: "session.text.ended",
+      data: { sessionID: "ses_test1", assistantMessageID: "msg_1", ordinal: 0, text: "被卡住的回答" },
+    })
+    await bridge.handleEvent({ type: "session.idle", data: { sessionID: "ses_test1" } })
+    ilink.refuseSends = false
+    clearSent()
+
+    await bridge.handleInbound(inbound("/more"))
+    const texts = sentTexts()
+    expect(texts.some((text) => text.includes("没发完"))).toBe(true)
+    expect(texts).toContain("被卡住的回答")
+    // The inbound itself flushed the queue, so /more explains that instead of
+    // asking the model to rewrite what just arrived.
+    expect(texts.at(-1)).toContain("已经补发")
+    // Nothing was asked of the model: the text was simply stuck.
+    expect(calls.prompts.length).toBe(promptsBefore)
+  })
+
+  test("/more asks the model to continue instead of forwarding the word", async () => {
+    const { bridge, calls } = await harness()
+    await bridge.handleInbound(inbound("/new 我的会话"))
+    clearSent()
+
+    await bridge.handleInbound(inbound("/more"))
+    expect(calls.prompts.length).toBe(1)
+    const prompt = String(calls.prompts[0]!.text)
+    expect(prompt).toContain("续写")
+    expect(prompt).not.toBe("继续")
+    // The request is for the model, not a message to the phone.
+    expect(sentTexts().length).toBe(0)
+  })
+
+  test("a long answer is numbered so a missing part is obvious", async () => {
+    const { bridge } = await harness({ chunkSize: 200 })
+    await bridge.handleInbound(inbound("/new 我的会话"))
+    clearSent()
+
+    const answer = Array.from({ length: 60 }, (_, index) => `第 ${index + 1} 行内容`).join("\n")
+    await bridge.handleEvent({
+      type: "session.text.ended",
+      data: { sessionID: "ses_test1", assistantMessageID: "msg_1", ordinal: 0, text: answer },
+    })
+    await bridge.handleEvent({ type: "session.idle", data: { sessionID: "ses_test1" } })
+
+    const texts = sentTexts()
+    expect(texts.length).toBeGreaterThan(1)
+    expect(texts[0]!.startsWith("（1/")).toBe(true)
+    expect(texts.at(-1)).toContain(`/${texts.length}）`)
+    // The marker must not push a chunk past the limit: the tail would be lost.
+    for (const text of texts) expect(text.length).toBeLessThanOrEqual(200)
   })
 })
 
@@ -1190,7 +1252,9 @@ describe("replies back to WeChat", () => {
     await bridge.handleEvent({ type: "session.idle", data: { sessionID: "ses_test1" } })
     const texts = sentTexts()
     expect(texts.length).toBeGreaterThan(1)
-    expect(texts.join("\n").replace(/\s/g, "")).toBe(long.replace(/\s/g, ""))
+    // The parts are numbered; strip the markers before comparing the content.
+    const stripped = texts.map((text) => text.replace(/^（\d+\/\d+）\n/, "")).join("\n").replace(/\s/g, "")
+    expect(stripped).toBe(long.replace(/\s/g, ""))
   })
 })
 
@@ -1214,7 +1278,8 @@ describe("the reply window", () => {
     clearSent()
     await bridge.handleInbound(inbound("在吗"))
     const texts = sentTexts()
-    expect(texts[0]).toBe("这条会被拒")
+    expect(texts[0]).toContain("没发完")
+    expect(texts[1]).toBe("这条会被拒")
     expect(logs.some((line) => line.includes("queued send delivered"))).toBe(true)
   })
 
@@ -1254,16 +1319,17 @@ describe("the reply window", () => {
     await first.bridge.handleEvent({ type: "session.idle", data: { sessionID: "ses_test1" } })
 
     const queued = readState().pendingOutbound?.[CONVERSATION] ?? []
-    expect(queued).toEqual(["重载也不能弄丢我"])
+    expect(queued[0]).toContain("没发完")
+    expect(queued).toContain("重载也不能弄丢我")
 
     // A reload: a new instance over the same state file must still have it.
     ilink.refuseSends = false
     clearSent()
     const second = await harness({}, { keepState: true })
-    expect(second.bridge.state.pendingOutbound?.[CONVERSATION]).toEqual(["重载也不能弄丢我"])
+    expect(second.bridge.state.pendingOutbound?.[CONVERSATION]).toContain("重载也不能弄丢我")
 
     await second.bridge.handleInbound(inbound("/retry"))
-    expect(sentTexts()[0]).toBe("重载也不能弄丢我")
+    expect(sentTexts()).toContain("重载也不能弄丢我")
     expect(readState().pendingOutbound ?? {}).toEqual({})
   })
 
@@ -1291,7 +1357,7 @@ describe("the reply window", () => {
     ilink.refuseSends = false
     clearSent()
     await bridge.handleInbound(inbound("还在吗"))
-    expect(sentTexts()[0]).toBe("等窗口重开")
+    expect(sentTexts()).toContain("等窗口重开")
     expect(readState().pendingOutbound ?? {}).toEqual({})
   })
 

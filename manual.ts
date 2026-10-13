@@ -137,6 +137,17 @@ export const COMMAND_DOCS: CommandDoc[] = [
     usage: "/retry",
   },
   {
+    name: "/more",
+    aliases: ["/继续", "/接着"],
+    summary: "回答没发全时用它：卡住的补发；确实没写完就让模型接着写",
+    usage: "/more",
+    notes: [
+      "有没发出去的内容：只补发，**不会调用模型**（不花 token、不污染上下文）",
+      "队列是空的：让模型从中断处续写，而不是把你的话当新问题回答",
+      "多段回答会标 （1/3）（2/3）…，看到缺号就直接发 /more",
+    ],
+  },
+  {
     name: "/model",
     aliases: ["/模型"],
     summary: "看/切换模型",
@@ -245,6 +256,7 @@ export const HELP_TEXT = [
   "/answer 答案       回答 agent 的提问",
   "",
   "其他",
+  "/more [继续|接着]   回答没发全：补发卡住的 / 让模型接着写",
   "/status /retry /ping /whoami /log [行数] /help",
   "",
   "电脑上的命令（在 opencode 里输入）",

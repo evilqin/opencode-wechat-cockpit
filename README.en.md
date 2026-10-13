@@ -37,6 +37,7 @@ is built for "**you are away, the computer is working**":
 | 🏠 **The phone has a home session** | Messages default to the phone's own home session; `/attach` **borrows** any desktop session (including one that is currently running), `/detach` hands it back. It is the same session on both sides, not a mirror. |
 | 🔒 **Single poller + self-healing** | One poller per machine no matter how many project windows are open; the lock records the *last completed long poll*, so an owner that goes silent is taken over within 2 minutes; a watchdog rebuilds a stalled connection. |
 | 📬 **Messages are not lost** | Refused sends are queued and retried with backoff, then flushed the moment you speak; the queue survives plugin hot-reloads; the long-poll cursor is persisted before dispatch, so a crash replays instead of dropping. |
+| 🔁 **Half an answer is still recoverable** | Multi-part replies are numbered `（1/3）…`; rate-limited parts are queued and re-sent automatically; `/more` (`/继续`) tells the two cases apart — **stuck text is re-sent without calling the model, only a genuinely unfinished answer asks it to continue** |
 | 🔁 **Duplicates cost nothing** | `message_id` dedup (last 200) so a redelivered message never triggers a second model call. |
 | 📚 **Manual on your phone** | `/help` for the overview, `/help attach` for one command, `/help 全部` for the full manual; `MANUAL.md` is generated from the same source as the bot's answers; `/list` supports paging. |
 | 🧪 **Tested** | 138 automated tests (unit + mock-iLink protocol + fake-context behaviour) with strict type checking (including `noUnusedLocals`). Real-device verification is at the bottom. |
@@ -151,7 +152,7 @@ the computer does not stall it.
 
 ### Misc
 
-`/status` connection · `/retry` flush the queue now · `/ping` · `/whoami` ·
+`/status` connection · `/more` (`/继续`) fetch a stuck tail, or make the model continue writing · `/retry` flush the queue now · `/ping` · `/whoami` ·
 `/log [行数]` · `/help [命令|全部]`
 
 ### Desktop commands (typed in opencode)
@@ -195,7 +196,7 @@ whatever you reply becomes the tool's return value.
   "autoTitle": true,               // name a session after its first message
   "ack": "off",                    // text = send "收到，开始处理…" immediately
   "sendDelayMs": 250,              // delay between chunks (bursts get refused more often)
-  "chunkSize": 3200,               // long answers are split
+  "chunkSize": 3900,               // long answers are split (service limit 4000); parts are numbered （1/3）
   "listLimit": 15,                 // rows per page of /list
   "allowedUsers": [],              // WeChat id allowlist; empty = the bound account only
   "agent": "",                     // pin an agent for new sessions
@@ -258,6 +259,7 @@ Logs: `~/.config/opencode/wechat/bridge.log`; `/status` and `/log` work from WeC
 | --- | --- |
 | no reaction to messages | no `poller started` in the log: log in first. Fresh heartbeat but stale `polledAt`: taken over within 2 minutes |
 | answer did not come back | look for `send refused`; `-2 prepare failed` = window closed (auto-flushed later), `-14` = token expired |
+| the answer stops halfway | multi-part replies are numbered `（1/3）（2/3）…`; a missing number means it was rate-limited — send `/more` to fetch the rest (with something stuck it **only re-sends, without calling the model**); send `/more` again to make the model continue writing |
 | computer answered, phone lags | reply delay = `turnGraceMs` (3 s) + backoff if refused; check `reply sent (trigger: …)` |
 | grey box instead of an image | `aes_key` encoding was wrong (must be base64 of hex text) — fixed here; open an issue if you see it |
 | `/list` misses desktop sessions | the local API is unavailable (`verify.ts` says so); only WeChat-created sessions are listed |
@@ -271,7 +273,7 @@ Logs: `~/.config/opencode/wechat/bridge.log`; `/status` and `/log` work from WeC
 ## Development
 
 ```bash
-bun test          # 138 tests: unit + mock iLink + fake-context Bridge behaviour
+bun test          # 147 tests: unit + mock iLink + fake-context Bridge behaviour
 bun run typecheck # strict check against the official @opencode/plugin types
 bun verify.ts     # environment self-check
 bun gen-manual.ts # regenerate MANUAL.md after editing manual.ts
@@ -323,7 +325,7 @@ Paths verified against the real Tencent service:
 
 Not yet exercised on real hardware (covered by tests): paging (`/list 2`, `/list all 2`),
 `/channel <n>`, `/help <command>` / `/help 全部`, borrowing a CLI session with `/attach <n>`,
-`/cancel`, `/rename`, `/dir`, `/retry`, `/log`, `/ping`, `/whoami`.
+`/cancel`, `/rename`, `/dir`, `/retry`, `/more`, `/log`, `/ping`, `/whoami`.
 
 ## Security
 

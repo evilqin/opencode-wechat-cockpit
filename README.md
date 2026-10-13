@@ -31,9 +31,10 @@ opencode **主动向外长轮询**腾讯 iLink 网关，所以电脑开着、ope
 | 🏠 **手机会话有「家」** | 手机默认待在自己的主会话；`/attach` 临时**借用**电脑上任何会话（包括正在跑的那个），`/detach` 归还，两边永远是同一条会话 |
 | 🔒 **单轮询器 + 自愈** | 多个项目窗口只跑一个轮询器；锁里记录「最后完成长轮询的时间」，持有者卡死 2 分钟内被接管；看门狗自动重建卡死的连接 |
 | 📬 **消息不会丢** | 微信拒收 → 入队 + 退避重试 → 你下次说话立刻补发；插件热重载不丢队列；游标先落盘，崩溃是重放不是丢消息 |
+| 🔁 **半截回答也能收全** | 多段回答自带编号 `（1/3）…`，被限流时入队并自动补发；`/more`（`/继续`）区分两种情况：**有卡住的就补发（不叫模型），确实没写完才让模型接着写** |
 | 🔁 **重复消息不花钱** | `message_id` 去重（最近 200 条），重复投递直接忽略，不会重复调用模型 |
 | 📚 **手机上就能查手册** | `/help` 总览、`/help 命令` 单条、`/help 全部` 全文；`MANUAL.md` 与代码同源自动生成；`/list` 支持翻页 |
-| 🧪 **有测试套件** | 138 个自动化测试（单元 + mock iLink 协议 + 假 ctx 行为测试）+ strict 类型检查（含 `noUnusedLocals`），真机验证记录见文末 |
+| 🧪 **有测试套件** | 147 个自动化测试（单元 + mock iLink 协议 + 假 ctx 行为测试）+ strict 类型检查（含 `noUnusedLocals`），真机验证记录见文末 |
 
 
 ## 文件构成
@@ -188,7 +189,7 @@ bun ...login-cli.ts --force    # 已登录时强制重新扫码
 
 ### 其他
 
-`/status` 通道状态 ｜ `/retry` 立刻重发卡住的消息 ｜ `/ping` ｜ `/whoami` ｜
+`/status` 通道状态 ｜ `/more`（`/继续`）回答没发全：补发卡住的、或让模型接着写 ｜ `/retry` 立刻重发卡住的消息 ｜ `/ping` ｜ `/whoami` ｜
 `/log [行数]` ｜ `/help`
 
 ## agent 能主动找你
@@ -223,7 +224,7 @@ bun ...login-cli.ts --force    # 已登录时强制重新扫码
   "autoTitle": true,               // 用第一条消息给会话命名
   "ack": "off",                    // text=收到消息立刻回一句「收到，开始处理…」
   "sendDelayMs": 250,              // 分片之间的间隔，太快容易被服务端拒
-  "chunkSize": 3200,               // 长回答分片大小
+  "chunkSize": 3900,               // 长回答分片大小（官方上限 4000，多段会标 （1/3））
   "listLimit": 15,                 // /list 显示条数
   "allowedUsers": [],              // 微信 id 白名单；空=只允许绑定账号
   "agent": "",                     // 新会话固定用的 agent
@@ -282,6 +283,7 @@ bun $env:USERPROFILE\.config\opencode\plugins\wechat\verify.ts
 | 发消息没反应 | 日志里没有 `poller started`：先登录。锁有心跳但 `polledAt` 很旧：2 分钟内会被别的实例接管 |
 | 电脑上答完、微信慢半分钟 | 回复延迟 = `turnGraceMs`（默认 3 秒）+ 被拒时的重试退避；日志 `reply sent (trigger: …)` 能看出是哪条路 |
 | 回答没回到微信 | 日志找 `send refused`；`-2 prepare failed` 是窗口关了（会自动补发），`-14` 是 token 失效 |
+| 回答只发了一半 | 多段回答会标 `（1/3）（2/3）…`，缺号就是被限流了：发 `/more` 补发（有卡住的东西时**只补发、不叫模型**）；确实没写完再发一次 `/more` 让模型续写 |
 | 手机收到灰框图片 | `aes_key` 编码错了（必须是 hex 文本的 base64）——本插件已对齐，若出现请提 issue |
 | `/list` 看不到桌面会话 | 本地 API 不可用（`verify.ts` 会指出来），此时只列微信建过的会话 |
 | 同一条消息处理两次 | 正常不会：有 `message_id` 去重 + 单轮询器 |
@@ -295,7 +297,7 @@ bun $env:USERPROFILE\.config\opencode\plugins\wechat\verify.ts
 
 ```powershell
 cd $env:USERPROFILE\.config\opencode\plugins\wechat
-bun test          # 138 个测试：单元 + mock iLink + 假 ctx 驱动的 Bridge 行为
+bun test          # 147 个测试：单元 + mock iLink + 假 ctx 驱动的 Bridge 行为
 bun run typecheck # 用官方 @opencode/plugin 类型做 strict 检查
 bun verify.ts     # 环境自检
 bun gen-manual.ts # 改了 manual.ts 之后重新生成 MANUAL.md
@@ -352,8 +354,8 @@ Select-String -Path ~/.config/opencode/node_modules/@opencode/client/dist/promis
 | 命令 | `/status` `/list` `/model`（40/73）`/agent` `/cost` `/switch` `/answer` | 每条都有对应的 `sent` 记录 |
 | 模型切换 | 会话 model 字段被改写 | 端点返回 204，字段确认更新 |
 
-未在真机上跑过、但代码路径与已验证部分共用：`/cancel`、`/rename`、`/dir`、`/retry`、`/log`、
-`/ping`、`/whoami`，以及 agent 自己发起的提问（form）。**新命令（翻页 `/list 2`、`/list all 2`、
+未在真机上跑过、但代码路径与已验证部分共用：`/cancel`、`/rename`、`/dir`、`/retry`、`/more`、
+`/log`、`/ping`、`/whoami`，以及 agent 自己发起的提问（form）。**新命令（翻页 `/list 2`、`/list all 2`、
 `/channel 序号`、`/help 命令`/`/help 全部`、`/attach 序号` 接管 CLI 会话）由测试覆盖**，等你在
 微信里实际用过一次就会补进上表。
 

@@ -96,6 +96,23 @@ const POLL_TIMEOUT_RESTART_AFTER = 3
 const POLL_RESTART_COOLDOWN_MS = 5 * 60_000
 /** A maintenance tick this late means the process was suspended (lid, standby). */
 const SUSPENSION_GAP_MS = 60_000
+/**
+ * How recently a flush must have delivered something for `/more` to treat the
+ * answer as "already recovered" instead of asking the model to continue.
+ */
+const MORE_DELIVERY_WINDOW_MS = 15_000
+/**
+ * What `/more` sends when nothing is queued and the model really did stop.
+ *
+ * Typing "继续" as an ordinary message makes the model treat it as a fresh
+ * question ("继续什么？"); this instruction tells it what actually happened.
+ */
+const CONTINUE_HINT = [
+  "（续写请求）你上一条回答在手机上显示不全、被认为没有写完。请从中断处接着写完剩下的部分：",
+  "· 不要重复已经发出的内容",
+  "· 不要重新解释问题、不要道歉、不要复述上下文",
+  "· 直接从断点续写",
+].join("\n")
 /** Inbound text beyond this is truncated for the prompt, with a note. */
 const MAX_INBOUND_CHARS = 8_000
 /** How much of the log `/log` prints. */
@@ -171,6 +188,8 @@ export class Bridge {
   #lastPollRestart = 0
   /** Previous ownership tick, to notice that the process was suspended. */
   #lastTickAt = 0
+  /** When the queue last delivered something, so `/more` can avoid duplicating it. */
+  #lastFlushedAt = new Map<string, number>()
 
   constructor(ctx: Context, config: WechatConfig, log: Logger, location: string, api: LocalApi) {
     this.#ctx = ctx
@@ -943,6 +962,12 @@ export class Bridge {
         await this.#retryQueued(conversationId)
         return true
 
+      case "/more":
+      case "/继续":
+      case "/接着":
+        await this.#more(conversationId)
+        return true
+
       case "/allow":
       case "/允许":
         await this.#resolveQueuedPermission(conversationId, argument, "once")
@@ -1468,7 +1493,7 @@ export class Bridge {
         `📮 有 ${queued.length} 条等你说话后补发：`,
         ...queued.slice(0, 5).map((text, index) => `${index + 1}. ${text.replace(/\s+/g, " ").slice(0, 80)}`),
         "",
-        "用 /retry 立刻重试，/queue clear 丢弃。",
+        "用 /more 立刻补发（/retry 同效），/queue clear 丢弃。",
       ].join("\n"),
     )
   }
@@ -1661,6 +1686,52 @@ export class Bridge {
       state.defaultDirectory = candidate
     })
     await this.#send(conversationId, `✅ 默认目录已设为\n${candidate}\n用 /new 在这个目录里开新会话。`)
+  }
+
+  /**
+   * `/more`: fetch what is stuck, or genuinely ask the model to continue.
+   *
+   * The two cases look identical to the user but need different actions: queued
+   * text only needs the reply window to be open, while an answer that really was
+   * cut off needs the model. Sending "继续" as an ordinary message does both at
+   * once — which is how a nudge turns into "继续什么？".
+   */
+  async #more(conversationId: string): Promise<void> {
+    const left = this.#queueFor(conversationId).length
+    if (left > 0) {
+      // The inbound that carried this command already tried to flush: text is
+      // still queued, so the window is shut and only talking helps.
+      await this.#send(
+        conversationId,
+        `还有 ${left} 条发不出去（窗口没开）。你再说一句话我就补发；想放弃可以发 /queue clear。`,
+      )
+      return
+    }
+
+    // Anything stuck was delivered moments ago by the inbound flush. Continuing
+    // now would duplicate what the user is reading, so explain instead — a
+    // second /more then means "keep writing".
+    if (Date.now() - (this.#lastFlushedAt.get(conversationId) ?? 0) < MORE_DELIVERY_WINDOW_MS) {
+      await this.#send(
+        conversationId,
+        "✅ 上面卡住的内容已经补发了。如果确实还有没写完的部分，再发一次 /more 我就让模型接着写。",
+      )
+      return
+    }
+
+    const binding = this.#state.bindings[conversationId]
+    if (!binding) {
+      await this.#send(conversationId, "当前没有会话。")
+      return
+    }
+    try {
+      await this.#ctx.session.prompt({ sessionID: binding.sessionID, text: CONTINUE_HINT })
+    } catch (error) {
+      await this.#send(conversationId, `❌ 续写请求失败：${errorText(error)}`)
+      return
+    }
+    await this.#setTyping(conversationId, true)
+    this.#typingSessions.set(binding.sessionID, conversationId)
   }
 
   async #retryQueued(conversationId: string): Promise<void> {
@@ -2153,12 +2224,40 @@ export class Bridge {
 
   /** Same as `#send`, but reports whether every chunk actually went out. */
   async #sendReturning(conversationId: string, text: string): Promise<boolean> {
+    // A numbered part needs room for its `（i/N）` marker, so multi-part replies
+    // are re-cut with a slightly smaller budget: the marker must never push a
+    // chunk over the service's limit, or its tail would be dropped silently.
+    const limit = this.#config.chunkSize
+    let chunks = chunkText(text, limit)
+    if (chunks.length > 1) chunks = numberChunks(chunkText(text, Math.max(64, limit - 12)))
+
+    const hadQueue = this.#queueFor(conversationId).length > 0
     let delivered = true
-    for (const chunk of chunkText(text, this.#config.chunkSize)) {
+    let failedFrom = -1
+    for (const [index, chunk] of chunks.entries()) {
       const ok = await this.sendChunk(conversationId, chunk)
-      if (!ok) delivered = false
+      if (ok) continue
+      delivered = false
+      if (failedFrom < 0) failedFrom = index
+    }
+
+    if (failedFrom >= 0 && !hadQueue) {
+      // The tail is queued; say so in front of it, otherwise a half-delivered
+      // answer looks like the model stopped on its own and the user has no way
+      // to know that simply speaking will fetch the rest.
+      const waiting = chunks.length - failedFrom
+      this.#prependToQueue(
+        conversationId,
+        `⚠️ 上面那条没发完（还有 ${waiting} 段）。发一句话或 /more 我就把剩下的补上。`,
+      )
     }
     return delivered
+  }
+
+  /** Put a line at the head of a conversation's queue. */
+  #prependToQueue(conversationId: string, text: string): void {
+    const queue = this.#queueFor(conversationId)
+    this.#setQueue(conversationId, [text, ...queue].slice(-20))
   }
 
   /** Send to the most recently active conversation. Used by the tools. */
@@ -2417,6 +2516,7 @@ export class Bridge {
     if (remaining.length === 0) {
       this.#setQueue(conversationId, [])
       this.#setRetryAttempt(conversationId, 0)
+      if (queue.length > 0) this.#lastFlushedAt.set(conversationId, Date.now())
       return
     }
 
@@ -2521,24 +2621,78 @@ export function renderForWechat(text: string): string {
     .trim()
 }
 
+/**
+ * Split a long answer into chunks the service will accept.
+ *
+ * Two rules matter: no chunk may exceed the per-message limit (the tail of an
+ * oversized message is silently dropped on the phone), and splitting must not
+ * lose a character. Lines are the preferred boundary; a line that is longer
+ * than the limit by itself (a minified blob, a long URL, a paragraph with no
+ * spaces) is cut, preferring a nearby break so words survive.
+ */
 export function chunkText(text: string, limit: number): string[] {
   const normalized = text.trim()
   if (normalized.length <= limit) return normalized ? [normalized] : []
 
+  // A tiny limit could otherwise make the fence bookkeeping longer than a whole
+  // chunk and loop forever; the smallest configured chunk is far above this.
+  const budget = Math.max(limit, 32)
   const chunks: string[] = []
   let current = ""
   let fence = false
 
+  const flush = (): void => {
+    if (current.trim()) chunks.push(fence ? `${current}\n\`\`\`` : current)
+    current = fence ? "```" : ""
+  }
+
+  const push = (piece: string): void => {
+    let rest = piece
+    while (rest.length > 0) {
+      const head = current === "" ? "" : "\n"
+      const room = budget - current.length - head.length
+      if (room <= 0) {
+        flush()
+        continue
+      }
+      if (rest.length <= room) {
+        current += head + rest
+        return
+      }
+      // The piece does not fit next to what is buffered. Start a fresh chunk
+      // first — unless the piece is longer than a whole chunk, in which case it
+      // cannot fit anywhere and has to be cut.
+      if (current !== "") {
+        flush()
+        continue
+      }
+      const slice = rest.slice(0, budget)
+      const breakAt = Math.max(slice.lastIndexOf(" "), slice.lastIndexOf("，"), slice.lastIndexOf("、"))
+      const take = breakAt > budget * 0.6 ? breakAt + 1 : budget
+      current = rest.slice(0, take)
+      flush()
+      rest = rest.slice(take)
+    }
+  }
+
   for (const line of normalized.split("\n")) {
     if (/^\s*```/.test(line)) fence = !fence
-    if (current && current.length + line.length + 1 > limit) {
-      chunks.push(fence ? `${current}\n\`\`\`` : current)
-      current = fence ? "```" : ""
-    }
-    current = current ? `${current}\n${line}` : line
+    push(line)
   }
-  if (current.trim()) chunks.push(current)
+  flush()
   return chunks
+}
+
+/**
+ * Number the parts of a multi-part reply: `（2/5）`.
+ *
+ * WeChat cannot edit a message, so a user who sees part 3 of 5 knows a part is
+ * missing — without this, a half-delivered answer just looks like the model
+ * stopped mid-sentence.
+ */
+export function numberChunks(chunks: string[]): string[] {
+  if (chunks.length <= 1) return chunks
+  return chunks.map((chunk, index) => `（${index + 1}/${chunks.length}）\n${chunk}`)
 }
 
 export function conversationIdOf(message: InboundMessage): string {

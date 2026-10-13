@@ -93,7 +93,7 @@ export const DEFAULT_CONFIG: WechatConfig = {
   directory: homedir(),
   progress: "tools",
   mirrorAll: false,
-  chunkSize: 3_200,
+  chunkSize: 3_900,
   listLimit: 15,
   stream: "off",
   streamIntervalMs: 8_000,
