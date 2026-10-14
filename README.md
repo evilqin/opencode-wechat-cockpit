@@ -116,7 +116,7 @@ bun ...login-cli.ts --force    # 已登录时强制重新扫码
 | --- | --- |
 | 直接发消息 | 交给当前绑定的 opencode 会话 |
 | 发图片 / 文件 / 视频 | 下载解密落到 `~/.config/opencode/wechat/inbox/`，路径交给 agent |
-| 发语音 | 用微信的转写文本（没有转写时只提示收到语音） |
+| 发语音 | 用微信的转写文本；没有转写时把 `.silk` 原文落到 inbox 并如实告知（桥**不会**转写语音） |
 
 ### 会话控制
 
@@ -240,7 +240,8 @@ bun ...login-cli.ts --force    # 已登录时强制重新扫码
   "agent": "",                     // 新会话固定用的 agent
   "model": "",                     // 新会话固定用的模型 providerID/modelID
   "askTimeoutMs": 600000,          // wechat_ask 等待回答的时限（毫秒）
-  "approvalBurstMs": 800           // 合并审批的窗口：一波多个审批只发一条消息
+  "approvalBurstMs": 800,          // 合并审批的窗口：一波多个审批只发一条消息
+  "retryBackoffMs": [5000, 15000, 45000, 120000, 300000]  // 被拒后的重试退避（最后一档后停手等下次消息）
 }
 ```
 
@@ -257,9 +258,11 @@ bun ...login-cli.ts --force    # 已登录时强制重新扫码
 **单轮询器。** 插件在每个打开的 location 都会加载一次，它们共用一个进程。锁文件用
 **独占创建**（`wx`）抢占，拿不到就每 10 秒自检一次；抢到锁的实例负责长轮询，并且每轮
 自己复查所有权——失去锁的轮询循环会自行退出，不会出现两个轮询器把同一条消息各处理一遍。
-锁里除心跳外还记录**最后一次完成长轮询的时间**（`polledAt`）：心跳只说明实例活着，不说明
-它还在收消息。待命实例发现 `polledAt` 超过 2 分钟没动，就判定持有者卡死并接管——这是
-「通道突然变哑、谁都没在轮询」那类故障的自愈机制（真机遇到过三次）。
+锁里除心跳外还记录**轮询循环最后活动的时间**（`polledAt`，含客户端超时的空轮询）与
+**服务端真实应答时间**（`answeredAt`）：心跳只说明实例活着，不说明它还在收消息。待命实例发现
+`polledAt` 超过 2 分钟没动，就判定持有者卡死并接管——这是「通道突然变哑、谁都没在轮询」那类
+故障的自愈机制（真机遇到过三次）；而 `answeredAt` 长期不动、`timeouts`（连续无应答次数）在涨，
+说明请求发得出去、回应回不来（门户认证掉了、网络在丢包），`verify.ts` 会把这种情况指出来。
 
 **消息去重。** 收到的 `message_id` 记在状态文件里（最近 200 条），重复投递直接忽略：
 重复投递的代价是一次真实的模型调用。
@@ -277,7 +280,8 @@ bun ...login-cli.ts --force    # 已登录时强制重新扫码
 日志里 `reply sent (trigger: timer)` 表示是兜底发的，`trigger: idle` 表示拿到了正常的结束信号。
 
 **本地 API。** 插件上下文没有「会话列表」和「表单回复」这两块能力，于是插件直接读
-`<state>/opencode/service.json` 里的地址与密码，用 HTTP Basic 调用本机 opencode API。
+`~/.local/state/opencode/service.json`（`$XDG_STATE_HOME` 优先，`WECHAT_SERVICE_FILE` 可覆盖）
+里的地址与密码，用 HTTP Basic 调用本机 opencode API。
 
 ## 排查
 
@@ -307,10 +311,11 @@ bun $env:USERPROFILE\.config\opencode\plugins\wechat\verify.ts
 
 ```powershell
 cd $env:USERPROFILE\.config\opencode\plugins\wechat
-bun test          # 174 个测试：单元 + mock iLink + 假 ctx 驱动的 Bridge 行为
-bun run typecheck # 用官方 @opencode/plugin 类型做 strict 检查
-bun verify.ts     # 环境自检
-bun gen-manual.ts # 改了 manual.ts 之后重新生成 MANUAL.md
+cd types; bun install    # 一次性：类型检查用的官方类型（types/ 被 gitignore）
+bun test                 # 174 个测试：单元 + mock iLink + 假 ctx 驱动的 Bridge 行为
+bun run typecheck        # strict 检查（缺依赖时会提示上面那句安装命令）
+bun verify.ts            # 环境自检
+bun gen-manual.ts        # 改了 manual.ts 之后重新生成 MANUAL.md
 ```
 
 三层测试各自负责一段：
@@ -365,7 +370,7 @@ Select-String -Path ~/.config/opencode/node_modules/@opencode/client/dist/promis
 | 模型切换 | 会话 model 字段被改写 | 端点返回 204，字段确认更新 |
 
 未在真机上跑过、但代码路径与已验证部分共用：`/cancel`、`/rename`、`/dir`、`/retry`、`/more`、
-`/log`、`/ping`、`/whoami`，以及 agent 自己发起的提问（form）。**新命令（翻页 `/list 2`、`/list all 2`、
+`/log`、`/ping`、`/whoami`。**新命令（翻页 `/list 2`、`/list all 2`、
 `/channel 序号`、`/help 命令`/`/help 全部`、`/attach 序号` 接管 CLI 会话）由测试覆盖**，等你在
 微信里实际用过一次就会补进上表。
 
@@ -387,8 +392,9 @@ Select-String -Path ~/.config/opencode/node_modules/@opencode/client/dist/promis
 
 ## 限制
 
-- 只处理单聊；群聊消息忽略（ClawBot 协议本身也只声明私聊）。
-- 出站支持文本、图片、视频、文件；**语音发送**未实现（接收侧用微信转写）。
+- 只处理单聊；群聊消息忽略（ClawBot 协议本身也只声明私聊），入站消息带 `group_id` 时直接丢掉。
+- 出站支持文本、图片、视频、文件；**语音发送**未实现。接收侧优先用微信转写文本，没有转写时
+  把 `.silk` 原文存进 inbox 并在提示里说明「桥不转写」（要转写请自己接一个 ASR）。
 - agent 的提问（form）走本地 API，因此在 `--standalone` 模式下如果注册文件指向别的进程，
   提问需要回电脑回答。
 - opencode v2 插件 API 目前是 beta，接口变化时需要跟着改。

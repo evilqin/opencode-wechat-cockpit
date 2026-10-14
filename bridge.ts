@@ -136,6 +136,8 @@ interface LiveBuffer {
   conversationId: string
   pending: string
   sent: number
+  /** A fragment handed to the send path but not confirmed yet (in flight). */
+  sending?: string
   /** Set when a streamed fragment could not be delivered. */
   degraded?: boolean
   timer?: NodeJS.Timeout
@@ -550,9 +552,18 @@ export class Bridge {
     for (const sessionID of sessions) {
       const live = this.#live.get(sessionID)
       const turn = this.#turns.get(sessionID)
-      // In live mode the sent fragments are already on the phone, so only the
-      // unsent tail is worth keeping; otherwise the whole assembled turn is.
-      const text = live && live.sent > 0 ? live.pending.trim() : (turn?.parts ?? []).join("\n\n").trim()
+      // Fragments already handed to the send path count as delivered, or a stop
+      // that lands mid-send would queue the whole turn behind a fragment that is
+      // about to arrive (the phone would get it twice).
+      const streamed = (live?.sent ?? 0) + (live?.sending?.length ?? 0)
+      // In live mode the delivered fragments are already on the phone, so only
+      // the unsent tail is worth keeping — unless a fragment was dropped, in
+      // which case the tail alone would be an orphan and the whole assembled
+      // turn is the safer thing to send (it matches what `#finishTurn` does).
+      const text =
+        live && streamed > 0 && !live.degraded
+          ? live.pending.trim()
+          : (turn?.parts ?? []).join("\n\n").trim()
       const conversationId = turn?.conversationId ?? live?.conversationId
       if (!text || !conversationId) continue
       // Queue items are flushed without re-chunking and `sendText` refuses
@@ -632,7 +643,13 @@ export class Bridge {
       const result = await downloadItem({ account: this.#state.account!, item })
       if (result.media) {
         attachments.push({ uri: pathToFileURL(result.media.path).href, name: result.media.name })
-        notes.push(`[收到附件 ${result.media.name}（${result.media.bytes} 字节），已保存为本地文件]`)
+        // Voice is the one kind the bridge cannot read: it arrives as .silk with
+        // WeChat's transcript only when the user sent one, so say what it is
+        // instead of handing the agent an opaque file.
+        const kindHint = result.media.kind === "voice" ? "语音（桥不转写，需转写请自行处理）" : "附件"
+        notes.push(
+          `[收到${kindHint} ${result.media.name}（${result.media.bytes} 字节），已保存为本地文件：${result.media.path}]`,
+        )
       } else if (result.note) {
         notes.push(`[${result.note}]`)
       }
@@ -2384,9 +2401,13 @@ export class Bridge {
     const text = renderForWechat(entry.pending).trim()
     entry.pending = ""
     if (!text) return
+    // Track what is in flight so a stop mid-send neither loses the fragment nor
+    // queues the whole turn behind it.
+    entry.sending = text
     // Streaming fragments are not queued: a stale fragment arriving minutes
     // later is worse than a gap, and the assembled turn covers the gap.
     const refused = await this.#chain(entry.conversationId, () => this.#trySend(entry.conversationId, text))
+    entry.sending = undefined
     if (refused) {
       entry.degraded = true
       this.#log.info(`streamed fragment dropped (errcode=${refused.errcode}); the full turn will be sent at the end`)

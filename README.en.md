@@ -35,7 +35,7 @@ is built for "**you are away, the computer is working**":
 | 🛂 **Approvals reach your phone** | When the agent wants to run a command or edit a file, WeChat gets a confirmation card — reply `1`/`2`/`3` and the turn continues. **Nothing gets stuck while you are away**; this is the main reason the plugin exists. |
 | ❓ **Questions too** | The agent's interactive forms (choice / free text) are delivered to WeChat and answered with `/answer`; the `wechat_ask` tool lets the agent ask you a question and **block on your answer**. |
 | 🏠 **The phone has a home session** | Messages default to the phone's own home session; `/attach` **borrows** any desktop session (including one that is currently running), `/detach` hands it back. It is the same session on both sides, not a mirror. |
-| 🔒 **Single poller + self-healing** | One poller per machine no matter how many project windows are open; the lock records the *last completed long poll*, so an owner that goes silent is taken over within 2 minutes; a watchdog rebuilds a stalled connection. |
+| 🔒 **Single poller + self-healing** | One poller per machine no matter how many project windows are open; the lock records when the poll loop last moved, so an owner that goes silent is taken over within 2 minutes; a watchdog rebuilds a stalled connection. |
 | 📬 **Messages are not lost** | Refused sends are queued and retried with backoff, then flushed the moment you speak; the queue survives plugin hot-reloads; the long-poll cursor is persisted before dispatch, so a crash replays instead of dropping. |
 | 🔁 **Half an answer is still recoverable** | Multi-part replies are numbered `（1/3）…`; rate-limited parts are queued and re-sent automatically; `/more` (`/继续`) tells the two cases apart — **stuck text is re-sent without calling the model, only a genuinely unfinished answer asks it to continue** |
 | 🔁 **Duplicates cost nothing** | `message_id` dedup (last 200) so a redelivered message never triggers a second model call. |
@@ -229,9 +229,10 @@ Environment variables (all optional):
 
 **Single poller.** The plugin loads once per open location and they share one process. The
 lock is claimed with an **exclusive create** (`wx`); losers re-check every 10 s, the winner
-long-polls and re-verifies ownership every cycle. Apart from a heartbeat, the lock stores the
-**last completed long poll** (`polledAt`): a heartbeat only proves the instance is alive, not
-that it is still receiving. A standby that sees `polledAt` frozen for 2 minutes takes over —
+long-polls and re-verifies ownership every cycle. Apart from a heartbeat, the lock stores when the
+**poll loop last moved** (`polledAt`, including empty client-side timeouts) and when the **server
+last actually answered** (`answeredAt`): a heartbeat only proves the instance is alive, not that it
+is still receiving. A standby that sees `polledAt` frozen for 2 minutes takes over —
 that is how "the channel suddenly went deaf with nobody polling" heals itself (seen three
 times on real hardware).
 
@@ -283,6 +284,7 @@ Logs: `~/.config/opencode/wechat/bridge.log`; `/status` and `/log` work from WeC
 ## Development
 
 ```bash
+cd types && bun install  # one-time: the official types (types/ is gitignored)
 bun test          # 174 tests: unit + mock iLink + fake-context Bridge behaviour
 bun run typecheck # strict check against the official @opencode/plugin types
 bun verify.ts     # environment self-check
@@ -354,11 +356,17 @@ Not yet exercised on real hardware (covered by tests): paging (`/list 2`, `/list
 
 ## Limitations
 
-- Direct messages only; group messages are ignored (the ClawBot protocol only declares DMs).
-- Outbound: text, image, video, file. **Sending voice is not implemented** (inbound voice uses
-  WeChat's transcription).
+- Direct messages only; group messages are ignored (the ClawBot protocol only declares DMs) — a
+  message carrying `group_id` is dropped before anything else happens.
+- Outbound: text, image, video, file. **Sending voice is not implemented.** Inbound voice prefers
+  WeChat's transcription; without one the `.silk` file is saved to the inbox and the note says the
+  bridge does not transcribe it (add your own ASR if you need text).
+- **A send that times out may be delivered twice**: a timeout is ambiguous (the service may have
+  accepted it), and the bridge prefers a duplicate over a lost answer.
 - Agent forms go through the local API, so in `--standalone` mode with a registration pointing
   at another process, questions have to be answered on the computer.
 - The opencode v2 plugin API is beta; interface changes will need a follow-up.
 - WeChat-created sessions live in the **default directory** (`~` by default), so they appear
   under that project; `/dir D:\code\repo` then `/new` puts them elsewhere.
+- Received attachments live in `~/.config/opencode/wechat/inbox` and are pruned after **14 days
+  or 512 MB**, whichever comes first.

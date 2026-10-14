@@ -53,13 +53,32 @@ async function writeQrPng(payload: string): Promise<string | undefined> {
   }
 }
 
-function ask(question: string): Promise<string> {
+/**
+ * Ask for the pairing verification code.
+ *
+ * Resolves `undefined` when stdin ends or nothing arrives within a minute.
+ * Without that, a piped or closed stdin left this promise pending forever, and
+ * the login's own 5-minute deadline could never fire while it was awaiting.
+ */
+function ask(question: string): Promise<string | undefined> {
+  if (!process.stdin.isTTY) return Promise.resolve(undefined)
   const rl = createInterface({ input: process.stdin, output: process.stdout })
   return new Promise((resolveText) => {
-    rl.question(question, (answer) => {
+    let settled = false
+    const finish = (answer: string | undefined): void => {
+      if (settled) return
+      settled = true
+      clearTimeout(timer)
       rl.close()
-      resolveText(answer.trim())
-    })
+      resolveText(answer)
+    }
+    const timer = setTimeout(() => {
+      console.log("\n（等待验证码超时，按放弃处理）")
+      finish(undefined)
+    }, 60_000)
+    timer.unref?.()
+    rl.on("close", () => finish(undefined))
+    rl.question(question, (answer) => finish(answer.trim() || undefined))
   })
 }
 
@@ -93,7 +112,8 @@ async function main(): Promise<void> {
       draft.account = undefined
       draft.syncBuf = undefined
     })
-    console.log("已清除本地凭据。若微信里的机器人仍然存在，重新登录时会复用同一个绑定。")
+    console.log("已清除本地凭据（0600 状态文件里的 token 已删除）。")
+    console.log("opencode 最多 10 秒内会停止轮询；若微信里的机器人仍然存在，重新登录时会复用同一个绑定。")
     return
   }
 
@@ -143,10 +163,7 @@ async function main(): Promise<void> {
           break
       }
     },
-    requestVerifyCode: async (attempt) => {
-      const answer = await ask(`服务端要求输入配对验证码（第 ${attempt} 次），直接回车放弃：`)
-      return answer || undefined
-    },
+    requestVerifyCode: async (attempt) => ask(`服务端要求输入配对验证码（第 ${attempt} 次），直接回车放弃：`),
   })
 
   if (result.account) {
@@ -163,7 +180,15 @@ async function main(): Promise<void> {
   }
 
   if (result.alreadyBound) {
-    console.log("服务端报告该账号已绑定到现有 bot，本地沿用已有凭据。")
+    if (readState().account?.token) {
+      console.log("服务端报告该账号已绑定到现有 bot，本地凭据仍然可用。")
+      return
+    }
+    // The binding lives on the server but this machine holds no credential for
+    // it: reporting success here is how a "logged in" channel ends up dead.
+    console.log("服务端报告该账号已绑定到某个 bot，但本机没有对应凭据。")
+    console.log("如果绑定在另一台机器上：先在那台机器执行 --logout，再回来扫码。")
+    process.exitCode = 1
     return
   }
 

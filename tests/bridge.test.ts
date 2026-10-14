@@ -420,6 +420,17 @@ async function waitFor(condition: () => boolean, timeoutMs = 2_000, label = "con
   throw new Error(`timed out waiting for ${label}`)
 }
 
+/**
+ * Wait until some delivered text contains `needle`.
+ *
+ * Prefer this over counting sends: a late delivery from a previous test's retry
+ * timer can land in the shared mock, and a count would then trip over traffic
+ * that has nothing to do with this test.
+ */
+async function waitForText(needle: string, timeoutMs = 2_000): Promise<void> {
+  await waitFor(() => sentTexts().some((text) => text.includes(needle)), timeoutMs, `text ${needle}`)
+}
+
 const DEFAULT_SESSIONS = [
   { id: "ses_remote1", title: "桌面端的会话", location: { directory: "D:\\code\\app" }, time: { updated: Date.now() } },
   { id: "ses_remote2", title: "另一个会话", location: { directory: "D:\\code\\docs" }, time: { updated: Date.now() } },
@@ -577,7 +588,7 @@ describe("commands", () => {
 
     await bridge.handleInbound(inbound("/help attach"))
     const card = sentTexts().join("\n")
-    expect(card).toContain("用法：/attach 序号|id")
+    expect(card).toContain("用法：/attach [序号|id]")
     expect(card).toContain("/follow")
 
     clearSent()
@@ -1209,8 +1220,8 @@ describe("replies back to WeChat", () => {
     // Nothing yet: the grace window exists so the turn's blocks can merge.
     expect(sentTexts().length).toBe(0)
 
-    await waitFor(() => sentTexts().length > 0, 2_000, "grace delivery")
-    expect(sentTexts()).toEqual(["没有 idle 的答案"])
+    await waitForText("没有 idle 的答案", 2_000)
+    expect(sentTexts().filter((text) => text.includes("没有 idle 的答案"))).toHaveLength(1)
   })
 
   test("idle and the grace timer together deliver the turn exactly once", async () => {
@@ -1223,11 +1234,11 @@ describe("replies back to WeChat", () => {
       data: { sessionID: "ses_test1", assistantMessageID: "msg_1", ordinal: 0, text: "只发一次" },
     })
     await bridge.handleEvent({ type: "session.idle", data: { sessionID: "ses_test1" } })
-    await waitFor(() => sentTexts().length > 0, 2_000, "turn delivery")
+    await waitForText("只发一次", 2_000)
     // Give the grace timer time to (not) send a second copy.
     await new Promise((resolve) => setTimeout(resolve, 60))
 
-    expect(sentTexts()).toEqual(["只发一次"])
+    expect(sentTexts().filter((text) => text.includes("只发一次"))).toHaveLength(1)
   })
 
   test("a failed execution reports the error after the partial text", async () => {
@@ -1463,8 +1474,9 @@ describe("the reply window", () => {
       data: { sessionID: "ses_test1", assistantMessageID: "msg_1", ordinal: 0, text: "前半段后半段" },
     })
     await bridge.handleEvent({ type: "session.idle", data: { sessionID: "ses_test1" } })
+    await waitForText("前半段后半段", 2_000)
     // The tail alone would have been "后半段" and meaningless on its own.
-    expect(sentTexts()).toEqual(["前半段后半段"])
+    expect(sentTexts().filter((text) => text.includes("前半段"))).toEqual(["前半段后半段"])
   })
 })
 
@@ -1799,6 +1811,8 @@ describe("hardening (audit follow-up)", () => {
     })
     bridge.stopPolling()
     expect(readState().pendingOutbound?.[CONVERSATION] ?? []).toContain("重载前的答案")
+    // Do not leave a retry timer behind for a later test to trip over.
+    await bridge.handleInbound(inbound("/queue clear"))
   })
 
   test("a second approval is announced with its real position", async () => {
@@ -1810,12 +1824,13 @@ describe("hardening (audit follow-up)", () => {
       type: "permission.asked",
       data: { id: "per_a", sessionID: "ses_test1", action: "bash", resources: ["rm -rf build"] },
     })
-    await waitFor(() => sentTexts().length >= 1, 2_000, "first approval")
+    // A single pending request has no "第 x/y" line; the second one does.
+    await waitForText("rm -rf build", 3_000)
     await bridge.handleEvent({
       type: "permission.asked",
       data: { id: "per_b", sessionID: "ses_test1", action: "edit", resources: ["src/app.ts"] },
     })
-    await waitFor(() => sentTexts().length >= 2, 2_000, "second approval")
+    await waitForText("第 2/2 个待审批", 3_000)
 
     // Numbering must agree with what `/allow <n>` resolves — announcing the new
     // request as "1/1" used to make a bare "1" apply to the *older* one.
@@ -1845,10 +1860,13 @@ describe("hardening (audit follow-up)", () => {
         data: { sessionID: "ses_test1", assistantMessageID: "msg_1", ordinal: 0, text: "窗口过期也能发" },
       })
       await bridge.handleEvent({ type: "session.idle", data: { sessionID: "ses_test1" } })
-      await waitFor(() => sentTexts().length > 0, 2_000, "fallback delivery")
-      expect(sentTexts()).toEqual(["窗口过期也能发"])
+      await waitForText("窗口过期也能发", 2_000)
+      expect(sentTexts().filter((text) => text.includes("窗口过期也能发"))).toHaveLength(1)
 
-      const sends = ilink.attempts.filter((entry) => entry.path === "POST /ilink/bot/sendmessage")
+      // Only this test's sends: a late delivery from another test could be first.
+      const sends = ilink.attempts
+        .filter((entry) => entry.path === "POST /ilink/bot/sendmessage")
+        .filter((entry) => JSON.stringify(entry.body).includes("窗口过期也能发"))
       expect(sends.length).toBeGreaterThanOrEqual(2)
       expect((sends[0]!.body.msg as { context_token?: string }).context_token).toBeDefined()
       expect((sends[1]!.body.msg as { context_token?: string }).context_token).toBeUndefined()
@@ -1874,7 +1892,12 @@ describe("hardening (audit follow-up)", () => {
     expect(queued).not.toContain("卡住的内容")
     // Both the stuck text and the ⚠️ notice that was queued in front of it.
     expect(queued.join("\n")).toContain("丢弃了 2 条")
+
+    // Leave no queue behind: its retry timer would deliver into the mock during
+    // a later test and make those counts (which share this mock) flaky.
     ilink.refuseSends = false
+    await bridge.handleInbound(inbound("/queue clear"))
+    expect(readState().pendingOutbound?.[CONVERSATION] ?? []).toEqual([])
   })
 
   test("/always and /deny all reach every pending request", async () => {

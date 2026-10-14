@@ -5,10 +5,16 @@ on:
     branches: [main]
   pull_request:
 
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
 jobs:
   test:
     name: 类型检查 + 测试
     runs-on: ubuntu-latest
+    # A hung test or install must not burn the 360-minute default.
+    timeout-minutes: 10
     steps:
       - name: 检出代码
         uses: actions/checkout@v4
@@ -16,7 +22,8 @@ jobs:
       - name: 安装 Bun
         uses: oven-sh/setup-bun@v2
         with:
-          bun-version: latest
+          # Pinned: a future Bun release must not be able to break CI by itself.
+          bun-version: 1.4.3
 
       - name: 安装类型检查依赖（types/ 子目录）
         working-directory: types
@@ -37,4 +44,7 @@ jobs:
       - name: 手册与代码同源（MANUAL.md 无漂移）
         run: |
           bun gen-manual.ts
+          # `git diff` alone ignores untracked files, so a PR that deleted
+          # MANUAL.md would pass with the regenerated copy sitting untracked.
           git diff --exit-code -- MANUAL.md
+          test -z "$(git status --porcelain -- MANUAL.md)"
