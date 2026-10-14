@@ -893,6 +893,57 @@ describe("commands", () => {
     expect(sentTexts().length).toBe(0)
   })
 
+  test("/more reports text that is still stuck instead of pretending", async () => {
+    const { bridge, calls } = await harness()
+    await bridge.handleInbound(inbound("/new 我的会话"))
+    const promptsBefore = calls.prompts.length
+
+    // Window shut for both the answer and the /more that follows it.
+    ilink.refuseSends = true
+    await bridge.handleEvent({
+      type: "session.text.ended",
+      data: { sessionID: "ses_test1", assistantMessageID: "msg_1", ordinal: 0, text: "还卡着呢" },
+    })
+    await bridge.handleEvent({ type: "session.idle", data: { sessionID: "ses_test1" } })
+    clearSent()
+
+    await bridge.handleInbound(inbound("/more"))
+    // Even the explanation cannot go out while the window is shut; it joins the
+    // queue, and the model is not bothered.
+    const queued = readState().pendingOutbound?.[CONVERSATION] ?? []
+    expect(queued.some((item) => item.includes("还有"))).toBe(true)
+    expect(calls.prompts.length).toBe(promptsBefore)
+
+    // Once the user speaks again everything lands, explanation first.
+    ilink.refuseSends = false
+    clearSent()
+    await bridge.handleInbound(inbound("在吗"))
+    const delivered = sentTexts().join("\n")
+    expect(delivered).toContain("没发完")
+    expect(delivered).toContain("还卡着呢")
+    expect(delivered).toContain("还有")
+  })
+
+  test("a second failure does not stack another notice", async () => {
+    const { bridge } = await harness()
+    await bridge.handleInbound(inbound("/new 我的会话"))
+    ilink.refuseSends = true
+
+    for (const text of ["第一条发不出去", "第二条也发不出去"]) {
+      await bridge.handleEvent({
+        type: "session.text.ended",
+        data: { sessionID: "ses_test1", assistantMessageID: "msg_1", ordinal: 0, text },
+      })
+      await bridge.handleEvent({ type: "session.idle", data: { sessionID: "ses_test1" } })
+    }
+
+    const queued = readState().pendingOutbound?.[CONVERSATION] ?? []
+    expect(queued.filter((item) => item.includes("没发完")).length).toBe(1)
+    expect(queued).toContain("第一条发不出去")
+    expect(queued).toContain("第二条也发不出去")
+    ilink.refuseSends = false
+  })
+
   test("a long answer is numbered so a missing part is obvious", async () => {
     const { bridge } = await harness({ chunkSize: 200 })
     await bridge.handleInbound(inbound("/new 我的会话"))
@@ -1686,5 +1737,66 @@ describe("mirroring other sessions", () => {
     })
     await bridge.handleEvent({ type: "session.idle", data: { sessionID: "ses_someone_elses" } })
     expect(sentTexts().length).toBe(0)
+  })
+})
+
+describe("hardening (audit follow-up)", () => {
+  test("a question asked by one instance is answered through shared state", async () => {
+    const first = await harness()
+    await first.bridge.handleInbound(inbound("/new 我的会话"))
+    clearSent()
+
+    const answer = first.bridge.ask(CONVERSATION, "选哪个？", 5_000)
+    await new Promise((resolve) => setTimeout(resolve, 50))
+    expect(readState().pendingQuestions?.[CONVERSATION]?.text).toBe("选哪个？")
+
+    // The instance that owns the poller may be a different one: it records the
+    // reply in shared state, and the asking instance resolves by watching it.
+    const second = await harness({}, { keepState: true })
+    await second.bridge.handleInbound(inbound("选第二个"))
+    expect(readState().questionAnswers?.[CONVERSATION]?.text).toBe("选第二个")
+    await expect(answer).resolves.toBe("选第二个")
+    expect(readState().pendingQuestions?.[CONVERSATION]).toBeUndefined()
+  })
+
+  test("stopping the poller preserves an assembled turn", async () => {
+    const { bridge } = await harness()
+    await bridge.handleInbound(inbound("/new 我的会话"))
+    clearSent()
+    await bridge.handleEvent({
+      type: "session.text.ended",
+      data: { sessionID: "ses_test1", assistantMessageID: "msg_1", ordinal: 0, text: "重载前的答案" },
+    })
+    bridge.stopPolling()
+    expect(readState().pendingOutbound?.[CONVERSATION] ?? []).toContain("重载前的答案")
+  })
+
+  test("a second approval is announced with its real position", async () => {
+    const { bridge } = await harness()
+    await bridge.handleInbound(inbound("/new 我的会话"))
+    clearSent()
+
+    await bridge.handleEvent({
+      type: "permission.asked",
+      data: { id: "per_a", sessionID: "ses_test1", action: "bash", resources: ["rm -rf build"] },
+    })
+    await new Promise((resolve) => setTimeout(resolve, 60))
+    await bridge.handleEvent({
+      type: "permission.asked",
+      data: { id: "per_b", sessionID: "ses_test1", action: "edit", resources: ["src/app.ts"] },
+    })
+    await new Promise((resolve) => setTimeout(resolve, 60))
+
+    // Numbering must agree with what `/allow <n>` resolves — announcing the new
+    // request as "1/1" used to make a bare "1" apply to the *older* one.
+    expect(sentTexts().join("\n")).toContain("第 2/2 个待审批")
+  })
+
+  test("sendToLast reports a refusal instead of throwing", async () => {
+    const { bridge } = await harness()
+    await bridge.handleInbound(inbound("/new 我的会话"))
+    ilink.refuseSends = true
+    await expect(bridge.sendToLast("发不出去")).resolves.toBe(false)
+    ilink.refuseSends = false
   })
 })

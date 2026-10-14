@@ -42,6 +42,16 @@ is built for "**you are away, the computer is working**":
 | 📚 **Manual on your phone** | `/help` for the overview, `/help attach` for one command, `/help 全部` for the full manual; `MANUAL.md` is generated from the same source as the bot's answers; `/list` supports paging. |
 | 🧪 **Tested** | 138 automated tests (unit + mock-iLink protocol + fake-context behaviour) with strict type checking (including `noUnusedLocals`). Real-device verification is at the bottom. |
 
+## Quickstart
+
+```bash
+# 1) clone into opencode's plugin directory (it is discovered automatically)
+git clone https://github.com/evilqin/opencode-wechat-cockpit.git ~/.config/opencode/plugins/wechat
+# 2) the QR login needs two dependencies (installed in the config directory)
+cd ~/.config/opencode && bun add qrcode qrcode-terminal
+# 3) type /wechat-login in an opencode session, scan with WeChat, then message the bot
+```
+
 ## Files
 
 | File | Role |
@@ -273,7 +283,7 @@ Logs: `~/.config/opencode/wechat/bridge.log`; `/status` and `/log` work from WeC
 ## Development
 
 ```bash
-bun test          # 147 tests: unit + mock iLink + fake-context Bridge behaviour
+bun test          # 160 tests: unit + mock iLink + fake-context Bridge behaviour
 bun run typecheck # strict check against the official @opencode/plugin types
 bun verify.ts     # environment self-check
 bun gen-manual.ts # regenerate MANUAL.md after editing manual.ts

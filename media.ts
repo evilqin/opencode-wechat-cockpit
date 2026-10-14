@@ -22,7 +22,7 @@
  */
 
 import { createCipheriv, createDecipheriv, createHash, randomBytes } from "node:crypto"
-import { mkdirSync, readFileSync, statSync, writeFileSync } from "node:fs"
+import { mkdirSync, readdirSync, readFileSync, rmSync, statSync, writeFileSync } from "node:fs"
 import { basename, extname, join } from "node:path"
 import {
   CDN_BASE_URL,
@@ -63,13 +63,20 @@ export async function downloadItem(params: {
     const raw = await fetchMedia({ ref: descriptor.ref, signal: params.signal })
     if (!raw) return { note: `${descriptor.name}：下载失败` }
 
+    if (descriptor.expectsKey && !descriptor.key) {
+      // Writing the ciphertext to a `.jpg` used to look like a successful
+      // download and handed the model garbage; say what actually happened.
+      return { note: `${descriptor.name}：附件密钥无法解析，已跳过` }
+    }
     const plain = descriptor.key ? decryptAesEcb(raw, descriptor.key) : raw
     if (!plain) return { note: `${descriptor.name}：解密失败` }
 
     mkdirSync(INBOX_DIR, { recursive: true })
     const safe = descriptor.name.replace(/[<>:"/\\|?*\u0000-\u001f]/g, "_").slice(0, 120)
     const path = join(INBOX_DIR, `${new Date().toISOString().replace(/[:.]/g, "-")}-${safe}`)
-    writeFileSync(path, plain)
+    // Private chat media: keep it as private as the credentials next to it.
+    writeFileSync(path, plain, { mode: 0o600 })
+    pruneInbox()
     return { media: { path, name: descriptor.name, kind: descriptor.kind, bytes: plain.byteLength } }
   } catch (error) {
     return { note: `${descriptor.name}：${error instanceof Error ? error.message : String(error)}` }
@@ -77,38 +84,48 @@ export async function downloadItem(params: {
 }
 
 function describe(item: MessageItem):
-  | { kind: DownloadedMedia["kind"]; name: string; ref?: MediaRef; key?: Buffer }
+  | { kind: DownloadedMedia["kind"]; name: string; ref?: MediaRef; key?: Buffer; expectsKey: boolean }
   | undefined {
   if (item.type === ItemType.IMAGE && item.image_item?.media) {
+    const media = item.image_item.media
     return {
       kind: "image",
       name: `image-${short(item.msg_id ?? String(Date.now()))}.jpg`,
-      ref: item.image_item.media,
-      key: decodeKey(item.image_item.aeskey ?? item.image_item.media.aes_key),
+      ref: media,
+      // `aeskey` wins when it decodes, but a present-but-unusable one must not
+      // stop us from trying the key carried by the media ref itself.
+      key: decodeKey(item.image_item.aeskey) ?? decodeKey(media.aes_key),
+      expectsKey: Boolean(item.image_item.aeskey?.trim() || media.aes_key?.trim()),
     }
   }
   if (item.type === ItemType.FILE && item.file_item?.media) {
+    const media = item.file_item.media
     return {
       kind: "file",
       name: item.file_item.file_name?.trim() || `file-${short(item.msg_id ?? String(Date.now()))}.bin`,
-      ref: item.file_item.media,
-      key: decodeKey(item.file_item.media.aes_key),
+      ref: media,
+      key: decodeKey(media.aes_key),
+      expectsKey: Boolean(media.aes_key?.trim()),
     }
   }
   if (item.type === ItemType.VIDEO && item.video_item?.media) {
+    const media = item.video_item.media
     return {
       kind: "video",
       name: `video-${short(item.msg_id ?? String(Date.now()))}.mp4`,
-      ref: item.video_item.media,
-      key: decodeKey(item.video_item.media.aes_key),
+      ref: media,
+      key: decodeKey(media.aes_key),
+      expectsKey: Boolean(media.aes_key?.trim()),
     }
   }
   if (item.type === ItemType.VOICE && item.voice_item?.media) {
+    const media = item.voice_item.media
     return {
       kind: "voice",
       name: `voice-${short(item.msg_id ?? String(Date.now()))}.silk`,
-      ref: item.voice_item.media,
-      key: decodeKey(item.voice_item.media.aes_key),
+      ref: media,
+      key: decodeKey(media.aes_key),
+      expectsKey: Boolean(media.aes_key?.trim()),
     }
   }
   return undefined
@@ -118,13 +135,71 @@ function short(value: string): string {
   return createHash("sha1").update(value).digest("hex").slice(0, 8)
 }
 
-/** Prefer the server-provided full URL, otherwise build one from the download param. */
-export async function fetchMedia(params: { ref?: MediaRef; signal?: AbortSignal }): Promise<Buffer | undefined> {
+/** One download must not hold the inbound pump forever. */
+const DOWNLOAD_TIMEOUT_MS = 60_000
+/** Largest inbound attachment worth buffering; bigger ones are refused. */
+export const MAX_DOWNLOAD_BYTES = 100 * 1024 * 1024
+
+/** Combine a caller signal with a deadline, without needing newer DOM types. */
+function withDeadline(signal: AbortSignal | undefined, ms: number): AbortSignal {
+  const anySignals = (AbortSignal as unknown as { any?: (signals: AbortSignal[]) => AbortSignal }).any
+  const timeout = (AbortSignal as unknown as { timeout?: (ms: number) => AbortSignal }).timeout
+  const deadline = timeout ? timeout(ms) : undefined
+  if (signal && deadline && anySignals) return anySignals([signal, deadline])
+  if (deadline) return deadline
+  if (signal) return signal
+  const controller = new AbortController()
+  const timer = setTimeout(() => controller.abort(), ms)
+  timer.unref?.()
+  return controller.signal
+}
+
+/** Download one attachment, with a deadline and a hard size budget. */
+export async function fetchMedia(params: {
+  ref?: MediaRef
+  signal?: AbortSignal
+  /** Overridable for tests. */
+  timeoutMs?: number
+  /** Overridable for tests. */
+  maxBytes?: number
+}): Promise<Buffer | undefined> {
   const url = mediaUrl(params.ref)
   if (!url) return undefined
-  const response = await fetch(url, { signal: params.signal })
+  const maxBytes = params.maxBytes ?? MAX_DOWNLOAD_BYTES
+
+  let response: Response
+  try {
+    response = await fetch(url, { signal: withDeadline(params.signal, params.timeoutMs ?? DOWNLOAD_TIMEOUT_MS) })
+  } catch {
+    // A timeout or a dropped connection means "could not download", which the
+    // caller turns into a note; it must not look like a crash.
+    return undefined
+  }
   if (!response.ok) return undefined
-  return Buffer.from(await response.arrayBuffer())
+
+  const declared = Number(response.headers.get("content-length") ?? "")
+  if (Number.isFinite(declared) && declared > maxBytes) return undefined
+
+  const reader = response.body?.getReader()
+  if (!reader) {
+    const buffer = Buffer.from(await response.arrayBuffer())
+    return buffer.byteLength > maxBytes ? undefined : buffer
+  }
+
+  const chunks: Buffer[] = []
+  let total = 0
+  while (true) {
+    const { done, value } = await reader.read()
+    if (done) break
+    if (!value) continue
+    total += value.byteLength
+    if (total > maxBytes) {
+      await reader.cancel().catch(() => undefined)
+      return undefined
+    }
+    chunks.push(Buffer.from(value))
+  }
+  return Buffer.concat(chunks)
 }
 
 export function mediaUrl(ref?: MediaRef): string | undefined {
@@ -172,6 +247,51 @@ export function encryptAesEcb(plaintext: Buffer, key: Buffer): Buffer {
 /** Ciphertext size after PKCS#7 padding to a 16-byte boundary. */
 export function aesEcbPaddedSize(plainSize: number): number {
   return Math.ceil((plainSize + 1) / 16) * 16
+}
+
+/** Received attachments older than this are deleted on the next download. */
+const INBOX_RETENTION_DAYS = 14
+/** …and the inbox as a whole is capped, oldest first. */
+const INBOX_MAX_BYTES = 512 * 1024 * 1024
+
+/**
+ * Keep the inbox bounded.
+ *
+ * Attachments are the user's own media, but nothing else ever removes them:
+ * private files would stay on disk forever, and every local user could read
+ * them. Retention is deliberately generous (two weeks, half a gigabyte).
+ */
+export function pruneInbox(now: number = Date.now()): number {
+  let removed = 0
+  try {
+    const cutoff = now - INBOX_RETENTION_DAYS * 24 * 60 * 60 * 1000
+    const kept: { path: string; mtime: number; size: number }[] = []
+    for (const name of readdirSync(INBOX_DIR)) {
+      const path = join(INBOX_DIR, name)
+      try {
+        const stats = statSync(path)
+        if (!stats.isFile()) continue
+        if (stats.mtimeMs < cutoff) {
+          rmSync(path, { force: true })
+          removed += 1
+          continue
+        }
+        kept.push({ path, mtime: stats.mtimeMs, size: stats.size })
+      } catch {
+        // A racing delete is fine.
+      }
+    }
+    let total = kept.reduce((sum, entry) => sum + entry.size, 0)
+    for (const entry of kept.sort((a, b) => a.mtime - b.mtime)) {
+      if (total <= INBOX_MAX_BYTES) break
+      rmSync(entry.path, { force: true })
+      total -= entry.size
+      removed += 1
+    }
+  } catch {
+    // No inbox yet.
+  }
+  return removed
 }
 
 /*
@@ -281,6 +401,7 @@ export async function prepareAttachment(params: {
     uploadFullUrl: uploadFullUrl || undefined,
     uploadParam: uploadParam ?? undefined,
     filekey,
+    signal: params.signal,
   })
 
   const uploaded: UploadedMedia = {
@@ -297,6 +418,8 @@ export async function prepareAttachment(params: {
 }
 
 const UPLOAD_ATTEMPTS = 3
+/** One CDN upload attempt may take this long before it is aborted. */
+const UPLOAD_TIMEOUT_MS = 180_000
 
 /** POST the ciphertext and read back the download parameter. */
 async function uploadCiphertext(params: {
@@ -305,6 +428,7 @@ async function uploadCiphertext(params: {
   uploadFullUrl?: string
   uploadParam?: string
   filekey: string
+  signal?: AbortSignal
 }): Promise<string> {
   const ciphertext = encryptAesEcb(params.buf, params.aesKey)
   const url =
@@ -321,6 +445,9 @@ async function uploadCiphertext(params: {
         method: "POST",
         headers: { "Content-Type": "application/octet-stream" },
         body: new Uint8Array(ciphertext),
+        // A hung CDN connection used to hold the per-conversation send chain
+        // forever, with nothing able to cancel it.
+        signal: withDeadline(params.signal, UPLOAD_TIMEOUT_MS),
       })
       if (response.status >= 400 && response.status < 500) {
         const detail = response.headers.get("x-error-message") ?? (await response.text()).slice(0, 200)
@@ -334,6 +461,8 @@ async function uploadCiphertext(params: {
       lastError = error
       // A 4xx is final: retrying the same request cannot help.
       if (error instanceof Error && error.message.startsWith("CDN 拒绝上传")) throw error
+      // A cancelled upload must not be retried either.
+      if (params.signal?.aborted) throw error
       if (attempt < UPLOAD_ATTEMPTS) await new Promise((resolve) => setTimeout(resolve, 500 * attempt))
     }
   }

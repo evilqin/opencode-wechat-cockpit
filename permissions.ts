@@ -48,11 +48,16 @@ export function parseDecision(text: string): PermissionDecision | undefined {
 }
 
 /** `1`, `2`, `3`, or an explicit verb — used by `/allow` and `/deny` too. */
-export function parseSelector(argument: string): { index?: number; all: boolean } {
+export function parseSelector(argument: string): { index?: number; all: boolean; invalid?: boolean } {
   const value = argument.trim().toLowerCase()
+  if (!value) return { all: false }
   if (value === "all" || value === "*" || value === "全部" || value === "所有") return { all: true }
+  // Approval is security-relevant: `2x`, `3.9` or `abc` must not silently select
+  // item 1 (or a truncated number) and then be acted on.
+  if (!/^\d+$/.test(value)) return { all: false, invalid: true }
   const index = Number.parseInt(value, 10)
-  return Number.isFinite(index) && index > 0 ? { index, all: false } : { all: false }
+  if (!Number.isFinite(index) || index < 1) return { all: false, invalid: true }
+  return { index, all: false }
 }
 
 function shorten(value: string, limit = 96): string {
@@ -89,14 +94,27 @@ export function formatPermissionPrompt(
   return lines.join("\n")
 }
 
-/** A compact list used when several approvals arrive in one burst. */
-export function formatPermissionBatch(requests: PendingPermission[], sessionTitle?: string): string {
-  const lines = [`🔐 opencode 需要你确认（${requests.length} 项）`]
+/**
+ * A compact list used when several approvals arrive in one burst.
+ *
+ * `positions` are the requests' places in the *whole* pending list, not 1..N of
+ * this burst: the numbers the user reads must be the numbers `/allow <n>`
+ * resolves, or a "deny 2" can land on a different request than the one shown.
+ */
+export function formatPermissionBatch(
+  requests: PendingPermission[],
+  positions: number[],
+  total: number,
+  sessionTitle?: string,
+): string {
+  const lines = [
+    `🔐 opencode 需要你确认（${requests.length} 项${total > requests.length ? `，共 ${total} 个待审批` : ""}）`,
+  ]
   if (sessionTitle) lines.push(`会话：${sessionTitle}`)
   lines.push("")
   for (const [index, request] of requests.entries()) {
     const target = shorten(request.resources[0] ?? "", 70)
-    lines.push(`${index + 1}. ${describeAction(request.action)}${target ? ` — ${target}` : ""}`)
+    lines.push(`${positions[index] ?? index + 1}. ${describeAction(request.action)}${target ? ` — ${target}` : ""}`)
   }
   lines.push("", "回复：/allow 序号 或 /deny 序号；/allow all 一次全允许。")
   return lines.join("\n")

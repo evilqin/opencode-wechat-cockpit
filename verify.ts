@@ -61,8 +61,14 @@ async function main(): Promise<void> {
 
   /* ---- config ---- */
   const config = readConfig()
-  line("默认目录", config.directory)
-  if (!existsSync(config.directory)) problems.push(`默认目录不存在：${config.directory}（用 /dir 改）`)
+  // `/dir` writes the state override, so the check and its advice must use the
+  // effective directory — reporting `config.directory` showed a value the bridge
+  // was not actually using.
+  const effectiveDirectory = state.defaultDirectory ?? config.directory
+  line("默认目录", effectiveDirectory)
+  if (!existsSync(effectiveDirectory)) {
+    problems.push(`默认目录不存在：${effectiveDirectory}（用 /dir 改，或在电脑上 /wechat-config dir）`)
+  }
   line("进度提示", config.progress === "tools" ? "显示工具调用" : "关闭")
   line("实时推送", config.stream === "live" ? `开（${config.streamIntervalMs / 1000}s）` : "关")
   line("回复延迟", `${config.turnGraceMs}ms（文本结束到发送的最长等待）`)

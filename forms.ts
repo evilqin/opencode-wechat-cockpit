@@ -87,16 +87,20 @@ export function resolveAnswer(form: PendingForm, input: string): ResolvedAnswer 
   if (!trimmed) return { error: "没有内容。用法：/answer <答案>" }
 
   // Field-by-field form: `1=value; 2=value`, with either width of separator.
-  const pairs = trimmed
+  const segments = trimmed
     .split(/[;\n；]+/)
     .map((entry) => entry.trim())
     .filter(Boolean)
-    .map((entry) => {
-      const match = entry.match(/^(\d+)\s*[=:：]\s*(.*)$/)
-      return match ? { index: Number.parseInt(match[1], 10) - 1, value: match[2] } : undefined
-    })
+  const pairs = segments.map((entry) => {
+    const match = entry.match(/^(\d+)\s*[=:：]\s*(.*)$/)
+    return match ? { index: Number.parseInt(match[1], 10) - 1, value: match[2] } : undefined
+  })
 
-  if (pairs.length > 0 && pairs.every((entry) => entry !== undefined)) {
+  // `1=value` is only a field reference when the form really has several
+  // questions (or the user sent several segments). With one field, `/answer 1:30`
+  // is a legitimate answer such as a time, not "question 1 gets 30".
+  const pairsEligible = fields.length > 1 || segments.length > 1
+  if (pairsEligible && pairs.length > 0 && pairs.every((entry) => entry !== undefined)) {
     const answer: Record<string, unknown> = {}
     const summary: string[] = []
     for (const pair of pairs) {
@@ -179,14 +183,14 @@ function convertValue(field: ApiFormField, raw: string): unknown {
       return `!无法理解为是/否：${value}`
     }
     case "integer": {
-      const parsed = Number.parseInt(value, 10)
-      if (!Number.isFinite(parsed)) return `!需要整数：${value}`
-      return parsed
+      // `Number.parseInt("")` is NaN but `Number("")` is 0: an empty answer must
+      // be rejected, not submitted as zero.
+      if (!/^-?\d+$/.test(value)) return `!需要整数：${value || "(空)"}`
+      return Number.parseInt(value, 10)
     }
     case "number": {
-      const parsed = Number(value)
-      if (!Number.isFinite(parsed)) return `!需要数字：${value}`
-      return parsed
+      if (!/^-?\d+(\.\d+)?$/.test(value)) return `!需要数字：${value || "(空)"}`
+      return Number(value)
     }
     case "multiselect": {
       const parts = value

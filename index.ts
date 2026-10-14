@@ -89,8 +89,13 @@ export default Plugin.define({
         bridge.reloadState()
         bridge.setConfig(readConfig())
         const owned = bridge.tryBecomeOwner()
-        if (owned && !stopEvents) stopEvents = subscribeToEvents(ctx, bridge, log)
-        else if (!owned && stopEvents) {
+        if (owned && !stopEvents) {
+          stopEvents = subscribeToEvents(ctx, bridge, log, () => {
+            // Resubscribe on the next tick (10s): an ended stream used to leave
+            // the channel "connected" with no events at all.
+            stopEvents = undefined
+          })
+        } else if (!owned && stopEvents) {
           stopEvents()
           stopEvents = undefined
         }
@@ -117,7 +122,12 @@ export default Plugin.define({
   },
 })
 
-function subscribeToEvents(ctx: Ctx, bridge: Bridge, log: { warn: (message: string) => void }): () => void {
+function subscribeToEvents(
+  ctx: Ctx,
+  bridge: Bridge,
+  log: { warn: (message: string) => void },
+  onEnd: () => void,
+): () => void {
   const controller = new AbortController()
   void (async () => {
     try {
@@ -130,6 +140,11 @@ function subscribeToEvents(ctx: Ctx, bridge: Bridge, log: { warn: (message: stri
       }
     } catch (error) {
       if (!controller.signal.aborted) log.warn(`event stream ended: ${errorText(error)}`)
+    } finally {
+      // The stream ended on its own: tell the ownership tick so it resubscribes.
+      // Otherwise the poller keeps running while answers, approvals and
+      // questions silently stop reaching the phone until a manual reload.
+      if (!controller.signal.aborted) onEnd()
     }
   })()
   return () => controller.abort()
@@ -267,6 +282,7 @@ async function registerCommands(ctx: Ctx, bridge: Bridge, log: { info: (m: strin
         }
         void login({
           existingTokens: existing,
+          onEventError: (error) => log.warn(`login event handler failed: ${errorText(error)}`),
           onEvent: async (event) => {
             switch (event.kind) {
               case "qr": {
@@ -359,7 +375,7 @@ async function registerCommands(ctx: Ctx, bridge: Bridge, log: { info: (m: strin
             .synthetic({
               sessionID,
               text: [
-                describeConfig(current),
+                describeConfig(current, bridge.defaultDirectory),
                 "",
                 "用法：",
                 "  /wechat-config progress off|tools",
@@ -428,7 +444,9 @@ async function registerCommands(ctx: Ctx, bridge: Bridge, log: { info: (m: strin
             break
           case "chunk": {
             const size = Number.parseInt(value, 10)
-            if (Number.isFinite(size) && size >= 200) next.chunkSize = size
+            // Clamp to the service's own per-message limit: a larger value would
+            // make every long reply lose its tail on the phone.
+            if (Number.isFinite(size) && size >= 200) next.chunkSize = Math.min(size, 4_000)
             break
           }
           case "list": {
@@ -469,20 +487,20 @@ async function registerCommands(ctx: Ctx, bridge: Bridge, log: { info: (m: strin
 
         writeConfig(next)
         bridge.setConfig(next)
-        await ctx.session.synthetic({ sessionID, text: describeConfig(next) }).catch(() => {})
+        await ctx.session.synthetic({ sessionID, text: describeConfig(next, bridge.defaultDirectory) }).catch(() => {})
       },
     })
   })
   log.info("commands registered: /wechat-login /wechat-attach /wechat-detach /wechat-status /wechat-config")
 }
 
-function describeConfig(config: WechatConfig): string {
+function describeConfig(config: WechatConfig, directory: string): string {
   return [
     "微信通道设置：",
     `进度提示：${config.progress === "tools" ? "显示工具调用" : "关闭"}（progress）`,
     `实时推送：${config.stream === "live" ? `开，每 ${Math.round(config.streamIntervalMs / 1000)} 秒` : "关"}（stream）`,
     `回复延迟：文本结束后最多等 ${config.turnGraceMs} 毫秒（grace）`,
-    `默认目录：${config.directory}（dir）`,
+    `默认目录：${directory}${directory === config.directory ? "" : "（/dir 覆盖）"}（dir）`,
     `镜像其他会话：${config.mirrorAll ? "开" : "关"}（mirror）`,
     `自动跟随：${config.followActive ? "开" : "关"}（follow，手动切换后 ${Math.round(config.followHoldMs / 60_000)} 分钟内不打扰）`,
     `自动命名：${config.autoTitle ? "开" : "关"}（autotitle）`,
@@ -534,6 +552,7 @@ async function renderQr(payload: string): Promise<string | undefined> {
     return undefined
   }
 }
+
 
 
 

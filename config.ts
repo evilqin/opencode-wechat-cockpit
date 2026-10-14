@@ -12,6 +12,7 @@ import { existsSync, readFileSync } from "node:fs"
 import { homedir } from "node:os"
 import { join } from "node:path"
 import { writePrivate, ensureStateDir, STATE_DIR } from "./state.ts"
+import { MAX_TEXT_CHARS } from "./ilink.ts"
 
 export const CONFIG_PATH = join(STATE_DIR, "config.json")
 
@@ -126,7 +127,9 @@ export function normalizeConfig(input: Partial<WechatConfig> | undefined): Wecha
     directory: pickString(raw.directory, DEFAULT_CONFIG.directory),
     progress: raw.progress === "off" ? "off" : "tools",
     mirrorAll: raw.mirrorAll === true,
-    chunkSize: pickNumber(raw.chunkSize, DEFAULT_CONFIG.chunkSize, 200),
+    // The service truncates anything longer than its own limit, silently, so a
+    // chunk size above it would drop the tail of every long message.
+    chunkSize: Math.min(pickNumber(raw.chunkSize, DEFAULT_CONFIG.chunkSize, 200), MAX_TEXT_CHARS),
     listLimit: pickNumber(raw.listLimit, DEFAULT_CONFIG.listLimit, 1),
     stream: raw.stream === "live" ? "live" : "off",
     streamIntervalMs: pickNumber(raw.streamIntervalMs, DEFAULT_CONFIG.streamIntervalMs, 1_000),

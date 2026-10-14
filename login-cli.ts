@@ -107,6 +107,9 @@ async function main(): Promise<void> {
   const existingTokens = state.account?.token ? [state.account.token] : []
   const result = await login({
     existingTokens,
+    onEventError: (error) => {
+      console.error("登录事件处理出错：", error instanceof Error ? error.message : String(error))
+    },
     onEvent: async (event) => {
       switch (event.kind) {
         case "qr": {

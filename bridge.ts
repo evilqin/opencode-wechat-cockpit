@@ -96,6 +96,8 @@ const POLL_TIMEOUT_RESTART_AFTER = 3
 const POLL_RESTART_COOLDOWN_MS = 5 * 60_000
 /** A maintenance tick this late means the process was suspended (lid, standby). */
 const SUSPENSION_GAP_MS = 60_000
+/** How many queued messages one conversation keeps before the oldest are dropped. */
+const QUEUE_LIMIT = 20
 /**
  * How recently a flush must have delivered something for `/more` to treat the
  * answer as "already recovered" instead of asking the model to continue.
@@ -140,11 +142,7 @@ interface LiveBuffer {
 }
 
 /** A question the agent asked and is blocked on. */
-interface PendingQuestion {
-  conversationId: string
-  resolve: (answer: string) => void
-  timer: NodeJS.Timeout
-}
+const QUESTION_POLL_MS = 1_000
 
 export class Bridge {
   readonly #ctx: Context
@@ -173,7 +171,6 @@ export class Bridge {
   #live = new Map<string, LiveBuffer>()
   #pendingPermissions: PendingPermission[] = []
   #pendingForms: PendingForm[] = []
-  #pendingQuestions = new Map<string, PendingQuestion>()
   #lastReconcile = 0
   #permissionBurst?: NodeJS.Timeout
   /** Per-conversation send chain, so chunks never interleave. */
@@ -184,12 +181,18 @@ export class Bridge {
   #lastListing = new Map<string, string[]>()
   #retryTimers = new Map<string, NodeJS.Timeout>()
   #stopMonitor?: () => void
+  /** The token the running monitor started with, for re-login detection. */
+  #pollingToken?: string
   /** When the poller was last rebuilt because polls stopped being answered. */
   #lastPollRestart = 0
   /** Previous ownership tick, to notice that the process was suspended. */
   #lastTickAt = 0
   /** When the queue last delivered something, so `/more` can avoid duplicating it. */
   #lastFlushedAt = new Map<string, number>()
+  /** Conversations whose queue is being flushed right now, so two flushes cannot race. */
+  #flushing = new Set<string>()
+  /** Bumped when a queue is dropped, so a flush in flight cannot resurrect it. */
+  #queueGenerations = new Map<string, number>()
 
   constructor(ctx: Context, config: WechatConfig, log: Logger, location: string, api: LocalApi) {
     this.#ctx = ctx
@@ -210,6 +213,11 @@ export class Bridge {
 
   get api(): LocalApi {
     return this.#api
+  }
+
+  /** The directory new sessions land in: a `/dir` override wins over config. */
+  get defaultDirectory(): string {
+    return this.#defaultDirectory()
   }
 
   setConfig(config: WechatConfig): void {
@@ -405,13 +413,31 @@ export class Bridge {
 
   /** Start the poller when this instance owns the slot. Safe to call repeatedly. */
   startPolling(): void {
-    if (this.#monitor) return
     if (!this.#lock || this.#lock.info.instanceId !== lockOwnerInstanceId()) return
-    if (!this.#state.account?.token) return
 
     const account = this.#state.account
+    if (!account?.token) {
+      // Logged out (or the token was cleared): nothing to poll, and a monitor
+      // still holding the old credential must not keep running.
+      if (this.#monitor) {
+        this.#log.info("no token; stopping the poller")
+        this.stopPolling()
+      }
+      return
+    }
+
+    // A re-login replaces the token. The running monitor holds the old one, so
+    // rebuild it rather than let it poll with a revoked credential (the server
+    // would reject it and the handler might wipe the fresh token).
+    if (this.#monitor && this.#pollingToken !== account.token) {
+      this.#log.info("token changed; rebuilding the poller")
+      this.stopPolling({ restart: true })
+    }
+    if (this.#monitor) return
+
     const controller = new AbortController()
     this.#stopMonitor = () => controller.abort()
+    this.#pollingToken = account.token
 
     const monitor = new ChannelMonitor({
       account,
@@ -428,28 +454,35 @@ export class Bridge {
       shouldContinue: () => this.ownsPoller,
       onStop: (reason, detail) => {
         this.#log.warn(`poll stopped: ${reason}${detail ? ` (${detail})` : ""}`)
-        if (reason === "stale-token") this.#handleStaleToken()
+        if (reason === "stale-token") this.#handleStaleToken(account.token)
       },
     })
 
     this.#monitor = monitor
     this.#log.info(`poller started for ${account.accountId} via ${account.baseUrl}`)
     void notifyStart(account).catch((error) => this.#log.warn(`notifystart failed: ${errorText(error)}`))
+
+    const forget = (): void => {
+      // Release the slot so the next ownership tick can start a fresh poller: a
+      // monitor that exited on its own used to keep `#monitor` set forever, so
+      // a re-login waited ~2 minutes for the stall watchdog.
+      if (this.#monitor !== monitor) return
+      this.#monitor = undefined
+      this.#stopMonitor = undefined
+      this.#pollingToken = undefined
+    }
     void monitor
       .run(controller.signal)
-      .then((reason) => this.#log.info(`poller exited: ${reason}`))
-      .catch((error) => this.#log.warn(`poller crashed: ${errorText(error)}`))
+      .then((reason) => {
+        forget()
+        this.#log.info(`poller exited: ${reason}`)
+      })
+      .catch((error) => {
+        forget()
+        this.#log.warn(`poller crashed: ${errorText(error)}`)
+      })
   }
 
-  /**
-   * Stop the poller.
-   *
-   * Two very different situations share this code: losing the slot (or
-   * unloading), where everything in flight belongs to the next owner and must
-   * be dropped; and a watchdog rebuild of a socket that stopped responding,
-   * where this instance keeps owning the slot and discarding buffered answers
-   * or pending questions would lose work for no reason.
-   */
   /**
    * A long poll was sent and nothing came back within the client budget.
    *
@@ -473,12 +506,25 @@ export class Bridge {
     this.startPolling()
   }
 
+  /**
+   * Stop the poller.
+   *
+   * Two very different situations share this code: losing the slot (or
+   * unloading), where everything in flight belongs to the next owner and must
+   * be dropped; and a watchdog rebuild of a socket that stopped responding,
+   * where this instance keeps owning the slot and discarding buffered answers
+   * or pending questions would lose work for no reason.
+   */
   stopPolling(options: { restart?: boolean } = {}): void {
     this.#stopMonitor?.()
     this.#stopMonitor = undefined
     this.#monitor = undefined
     if (options.restart) return
 
+    // Hand any assembled-but-unsent turn to the persisted queue first: a hot
+    // reload is routine, and losing a finished answer to one is invisible to
+    // everyone (the agent believes it reported, the user sees nothing).
+    this.#preserveTurnBuffers()
     for (const timer of this.#typingTimers.values()) clearInterval(timer)
     this.#typingTimers.clear()
     this.#typingSessions.clear()
@@ -486,17 +532,39 @@ export class Bridge {
     this.#retryTimers.clear()
     for (const turn of this.#turns.values()) if (turn.timer) clearTimeout(turn.timer)
     this.#turns.clear()
-    for (const live of this.#live.values()) if (live.timer) clearTimeout(live.timer)
+    for (const live of this.#live.values()) if (live.timer) clearInterval(live.timer)
     this.#live.clear()
-    for (const question of this.#pendingQuestions.values()) {
-      clearTimeout(question.timer)
-      question.resolve("通道已停止（轮询器退出），这个问题没有等到回答。")
-    }
-    this.#pendingQuestions.clear()
   }
 
-  /** The token was rejected: stop, and say what to do about it. */
-  #handleStaleToken(): void {
+  /** Move every buffered turn into the persisted queue, so a stop cannot eat it. */
+  #preserveTurnBuffers(): void {
+    const sessions = new Set([...this.#turns.keys(), ...this.#live.keys()])
+    for (const sessionID of sessions) {
+      const live = this.#live.get(sessionID)
+      const turn = this.#turns.get(sessionID)
+      // In live mode the sent fragments are already on the phone, so only the
+      // unsent tail is worth keeping; otherwise the whole assembled turn is.
+      const text = live && live.sent > 0 ? live.pending.trim() : (turn?.parts ?? []).join("\n\n").trim()
+      const conversationId = turn?.conversationId ?? live?.conversationId
+      if (!text || !conversationId) continue
+      this.#enqueue(conversationId, [renderForWechat(text)])
+      this.#log.info(`preserved an unfinished turn (${text.length} chars) before stopping`)
+    }
+  }
+
+  /**
+   * The token was rejected: stop and say what to do about it.
+   *
+   * Only the token the *running* poller used may be cleared. A re-login can land
+   * between the rejection and this call, and wiping the fresh credential would
+   * cost the user another QR scan for a channel that was already fixed.
+   */
+  #handleStaleToken(rejectedToken?: string): void {
+    const current = this.#state.account?.token
+    if (rejectedToken !== undefined && current !== rejectedToken) {
+      this.#log.info("a stale-token report arrived for an old credential; keeping the current one")
+      return
+    }
     this.#state = updateState((state) => {
       if (state.account) state.account = { ...state.account, token: "" }
     })
@@ -575,12 +643,19 @@ export class Bridge {
 
     // A question from `wechat_ask` consumes the next ordinary message: the agent
     // is blocked on it, so anything else would be answered out of order.
-    const question = this.#pendingQuestions.get(conversationId)
-    if (question) {
-      this.#pendingQuestions.delete(conversationId)
-      clearTimeout(question.timer)
+    // A question from `wechat_ask` consumes the next ordinary message: the agent
+    // is blocked on it. Both sides of that exchange live in shared state, because
+    // the instance running the tool is not necessarily the instance reading the
+    // reply — and a plugin reload must not lose the question either.
+    const pending = this.#state.pendingQuestions?.[conversationId]
+    if (pending && pending.expiresAt > Date.now()) {
+      this.#state = updateState((state) => {
+        state.questionAnswers = {
+          ...(state.questionAnswers ?? {}),
+          [conversationId]: { text, answeredAt: Date.now() },
+        }
+      })
       this.#log.info(`question answered: ${text.slice(0, 80)}`)
-      question.resolve(text)
       return
     }
 
@@ -607,12 +682,19 @@ export class Bridge {
    * than a session that was told to proceed.
    */
   async ask(conversationId: string, question: string, timeoutMs: number): Promise<string> {
-    if (this.#pendingQuestions.has(conversationId)) {
+    const existing = this.#state.pendingQuestions?.[conversationId]
+    if (existing && existing.expiresAt > Date.now()) {
       return "已经有一个问题在等用户回答了，请先等它返回。"
     }
 
+    const askedAt = Date.now()
+    const expiresAt = askedAt + timeoutMs
     this.#state = updateState((state) => {
       state.lastConversation = conversationId
+      state.pendingQuestions = {
+        ...(state.pendingQuestions ?? {}),
+        [conversationId]: { text: question.trim(), askedAt, expiresAt },
+      }
     })
 
     const delivered = await this.#sendReturning(
@@ -625,16 +707,56 @@ export class Bridge {
       ].join("\n"),
     )
     if (!delivered) {
+      this.#clearQuestion(conversationId, askedAt)
       return "微信消息没有发出去（通道未登录，或回复窗口关闭后正在重试）。请改用普通回复说明情况。"
     }
 
-    return await new Promise<string>((resolve) => {
-      const timer = setTimeout(() => {
-        this.#pendingQuestions.delete(conversationId)
-        resolve(`用户在 ${Math.round(timeoutMs / 60_000)} 分钟内没有回答。`)
-      }, timeoutMs)
+    return await this.#awaitAnswer(conversationId, askedAt, timeoutMs)
+  }
+
+  /**
+   * Wait for the answer to a question, watching the shared state.
+   *
+   * The reply is written by whichever instance owns the poller, which may be a
+   * different one; polling state is what makes the tool work in a multi-window
+   * setup instead of timing out after ten minutes.
+   */
+  #awaitAnswer(conversationId: string, askedAt: number, timeoutMs: number): Promise<string> {
+    return new Promise<string>((resolve) => {
+      const deadline = askedAt + timeoutMs
+      const finish = (text: string): void => {
+        clearInterval(timer)
+        this.#clearQuestion(conversationId, askedAt)
+        resolve(text)
+      }
+      const timer = setInterval(() => {
+        const answer = readState().questionAnswers?.[conversationId]
+        if (answer && answer.answeredAt >= askedAt) {
+          this.#log.info(`question answered: ${answer.text.slice(0, 80)}`)
+          finish(answer.text)
+          return
+        }
+        if (Date.now() > deadline) finish(`用户在 ${Math.round(timeoutMs / 60_000)} 分钟内没有回答。`)
+      }, QUESTION_POLL_MS)
       timer.unref?.()
-      this.#pendingQuestions.set(conversationId, { conversationId, resolve, timer })
+    })
+  }
+
+  /** Drop a settled question, and the answer that settled it. */
+  #clearQuestion(conversationId: string, askedAt: number): void {
+    this.#state = updateState((state) => {
+      const pending = state.pendingQuestions?.[conversationId]
+      if (pending && pending.askedAt === askedAt) {
+        const next = { ...(state.pendingQuestions ?? {}) }
+        delete next[conversationId]
+        state.pendingQuestions = next
+      }
+      const answer = state.questionAnswers?.[conversationId]
+      if (answer && answer.answeredAt >= askedAt) {
+        const next = { ...(state.questionAnswers ?? {}) }
+        delete next[conversationId]
+        state.questionAnswers = next
+      }
     })
   }
 
@@ -648,7 +770,10 @@ export class Bridge {
     const allowed = this.#config.allowedUsers
     if (allowed.length === 0) {
       const bound = this.#state.account?.userId
-      return !bound || bound === peerId
+      // Not logged in: nobody is bound, so nobody may drive the bot. This used
+      // to allow everyone whenever the account was missing.
+      if (!bound) return false
+      return bound === peerId
     }
     if (allowed.includes(peerId)) return true
     return this.#state.account?.userId === peerId && allowed.includes("self")
@@ -1540,6 +1665,14 @@ export class Bridge {
     }
     try {
       await this.#ctx.session.interrupt({ sessionID: binding.sessionID })
+      // An interrupted turn may never report idle, and the typing indicator and
+      // live buffer are only stopped by that report: stop them here instead of
+      // leaving "typing…" on the phone indefinitely.
+      await this.#setTyping(conversationId, false)
+      this.#typingSessions.delete(binding.sessionID)
+      const live = this.#live.get(binding.sessionID)
+      if (live?.timer) clearInterval(live.timer)
+      this.#live.delete(binding.sessionID)
       const dropped = argument === "all" ? this.#dropQueue(conversationId) : 0
       await this.#send(
         conversationId,
@@ -1814,6 +1947,10 @@ export class Bridge {
     }
 
     const selector = parseSelector(argument)
+    if (selector.invalid) {
+      await this.#send(conversationId, `看不懂序号：${argument}（用 /allow 序号、/deny 序号，或 /allow all）`)
+      return
+    }
     if (selector.all) {
       for (const item of pending) await this.#replyPermission(conversationId, item, decision)
       await this.#send(conversationId, `✅ 已对 ${pending.length} 个请求执行：${DECISION_LABEL[decision]}`)
@@ -1868,7 +2005,13 @@ export class Bridge {
       announced: false,
     }
     this.#pendingPermissions.push(request)
-    while (this.#pendingPermissions.length > MAX_PENDING_PERMISSIONS) this.#pendingPermissions.shift()
+    while (this.#pendingPermissions.length > MAX_PENDING_PERMISSIONS) {
+      const dropped = this.#pendingPermissions.shift()
+      if (dropped) {
+        // Dropping shifts every index, so it must never be silent.
+        this.#log.warn(`too many pending approvals (${MAX_PENDING_PERMISSIONS}); dropped the oldest (${dropped.requestID})`)
+      }
+    }
 
     // An agent that needs three things approved asks three times in a row; the
     // user should get one message, not three. Wait a moment for the burst to
@@ -1896,15 +2039,20 @@ export class Bridge {
     for (const [conversationId, requests] of byConversation) {
       for (const request of requests) request.announced = true
       const binding = this.#state.bindings[conversationId]
+      // Number against the whole pending list, so a digit means the same request
+      // now (bare reply) and later (`/allow <n>`); numbering just this burst
+      // used to shift every index whenever older approvals were still waiting.
+      const pending = this.#pendingPermissions.filter((item) => item.conversationId === conversationId)
+      const positions = requests.map((item) => pending.indexOf(item) + 1)
       if (requests.length === 1) {
-        const request = requests[0]
+        const request = requests[0]!
         await this.#send(
           conversationId,
-          formatPermissionPrompt(request, 1, 1, binding?.title),
+          formatPermissionPrompt(request, positions[0] ?? 1, pending.length, binding?.title),
         )
         continue
       }
-      await this.#send(conversationId, formatPermissionBatch(requests, binding?.title))
+      await this.#send(conversationId, formatPermissionBatch(requests, positions, pending.length, binding?.title))
     }
   }
 
@@ -2091,7 +2239,13 @@ export class Bridge {
     const entry = existing ?? { conversationId, parts: [] }
     entry.parts.push(text)
     if (entry.timer) clearTimeout(entry.timer)
-    entry.timer = setTimeout(() => void this.#finishTurn(sessionID, "timer"), this.#config.turnGraceMs)
+    entry.timer = setTimeout(
+      () =>
+        void this.#finishTurn(sessionID, "timer").catch((error) =>
+          this.#log.warn(`turn flush failed: ${errorText(error)}`),
+        ),
+      this.#config.turnGraceMs,
+    )
     entry.timer.unref?.()
     this.#turns.set(sessionID, entry)
   }
@@ -2158,7 +2312,9 @@ export class Bridge {
     entry.pending += delta
     if (!entry.timer) {
       entry.timer = setInterval(() => {
-        void this.#flushLive(sessionID)
+        void this.#flushLive(sessionID).catch((error) =>
+          this.#log.warn(`live flush failed: ${errorText(error)}`),
+        )
       }, this.#config.streamIntervalMs)
       entry.timer.unref?.()
     }
@@ -2173,7 +2329,7 @@ export class Bridge {
     if (!text) return
     // Streaming fragments are not queued: a stale fragment arriving minutes
     // later is worse than a gap, and the assembled turn covers the gap.
-    const refused = await this.#trySend(entry.conversationId, text)
+    const refused = await this.#chain(entry.conversationId, () => this.#trySend(entry.conversationId, text))
     if (refused) {
       entry.degraded = true
       this.#log.info(`streamed fragment dropped (errcode=${refused.errcode}); the full turn will be sent at the end`)
@@ -2217,7 +2373,7 @@ export class Bridge {
    */
   async #sendEphemeral(conversationId: string, text: string): Promise<void> {
     for (const chunk of chunkText(text, this.#config.chunkSize)) {
-      const refused = await this.#trySend(conversationId, chunk)
+      const refused = await this.#chain(conversationId, () => this.#trySend(conversationId, chunk))
       if (refused) this.#log.info(`dropped ephemeral message (errcode=${refused.errcode}): ${preview(chunk, 40)}`)
     }
   }
@@ -2256,8 +2412,31 @@ export class Bridge {
 
   /** Put a line at the head of a conversation's queue. */
   #prependToQueue(conversationId: string, text: string): void {
+    this.#enqueue(conversationId, [text], true)
+  }
+
+  /**
+   * Add items to a conversation's queue, keeping it bounded.
+   *
+   * The cap favours the newest items — the tail of a long answer matters more
+   * than its first chunk — except for a prepended notice, which must survive so
+   * the user still learns that something was cut. Either way the drop is logged,
+   * never silent.
+   */
+  #enqueue(conversationId: string, items: string[], atHead = false): void {
     const queue = this.#queueFor(conversationId)
-    this.#setQueue(conversationId, [text, ...queue].slice(-20))
+    const merged = atHead ? [...items, ...queue] : [...queue, ...items]
+    if (merged.length <= QUEUE_LIMIT) {
+      this.#setQueue(conversationId, merged)
+      return
+    }
+    const dropped = merged.length - QUEUE_LIMIT
+    const head = atHead ? Math.min(items.length, QUEUE_LIMIT) : 0
+    this.#log.warn(`queue full (${QUEUE_LIMIT}): dropped ${dropped} oldest item(s) for ${conversationId}`)
+    this.#setQueue(conversationId, [
+      ...merged.slice(0, head),
+      ...merged.slice(merged.length - (QUEUE_LIMIT - head)),
+    ])
   }
 
   /** Send to the most recently active conversation. Used by the tools. */
@@ -2266,7 +2445,9 @@ export class Bridge {
     const conversationId = this.#state.lastConversation
     if (!conversationId) return false
     for (const chunk of chunkText(text, this.#config.chunkSize)) {
-      const ok = await this.sendChunk(conversationId, chunk, true)
+      // Refusals are queued by the send path; report the failure instead of
+      // throwing, so the tool can tell the agent what to do next.
+      const ok = await this.sendChunk(conversationId, chunk)
       if (!ok) return false
     }
     return true
@@ -2320,6 +2501,10 @@ export class Bridge {
 
   /** One send attempt for a single item, with the no-context-token fallback. */
   async #trySendItem(conversationId: string, item: unknown): Promise<SendRefusedError | undefined> {
+    return this.#chain(conversationId, () => this.#trySendItemNow(conversationId, item))
+  }
+
+  async #trySendItemNow(conversationId: string, item: unknown): Promise<SendRefusedError | undefined> {
     const account = this.#state.account
     if (!account?.token) return new SendRefusedError("微信通道尚未登录", LOCAL_FAILURE)
     const peerId = conversationId.split(":").pop()
@@ -2389,11 +2574,19 @@ export class Bridge {
    * ordering their chunks would interleave on the phone.
    */
   async sendChunk(conversationId: string, chunk: string, throwOnFailure = false): Promise<boolean> {
+    return this.#chain(conversationId, () => this.#sendChunkNow(conversationId, chunk, throwOnFailure))
+  }
+
+  /**
+   * Run one outbound task after everything already queued for this conversation.
+   *
+   * Every send goes through here — answers, tool progress, live fragments, queue
+   * flushes and attachments — because otherwise a `🔧 bash: …` line lands in the
+   * middle of a numbered reply.
+   */
+  #chain<T>(conversationId: string, task: () => Promise<T>): Promise<T> {
     const previous = this.#sendChains.get(conversationId) ?? Promise.resolve()
-    const next = previous.then(
-      () => this.#sendChunkNow(conversationId, chunk, throwOnFailure),
-      () => this.#sendChunkNow(conversationId, chunk, throwOnFailure),
-    )
+    const next = previous.then(task, task)
     this.#sendChains.set(
       conversationId,
       next.then(
@@ -2411,11 +2604,14 @@ export class Bridge {
       return true
     }
 
-    const queue = this.#queueFor(conversationId)
-    queue.push(chunk)
-    this.#setQueue(conversationId, queue.slice(-20))
-    if (refused.errcode === LOCAL_FAILURE) this.#log.warn(`send failed: ${refused.message}`)
-    else this.#log.warn(`send refused (errcode=${refused.errcode}): ${refused.message} | 内容：${preview(chunk, 60)}`)
+    this.#enqueue(conversationId, [chunk])
+    if (refused.errcode === LOCAL_FAILURE) {
+      // Not a protocol refusal: the request may have reached the service before
+      // the connection broke, so the retry can duplicate the message.
+      this.#log.warn(`send failed (possibly delivered): ${refused.message}`)
+    } else {
+      this.#log.warn(`send refused (errcode=${refused.errcode}): ${refused.message} | 内容：${preview(chunk, 60)}`)
+    }
     this.#scheduleRetry(conversationId)
     if (throwOnFailure) throw refused
     return false
@@ -2459,6 +2655,8 @@ export class Bridge {
     const queued = this.#queueFor(conversationId)
     this.#setQueue(conversationId, [])
     this.#setRetryAttempt(conversationId, 0)
+    // Tell a flush that is in flight that this queue is gone.
+    this.#queueGenerations.set(conversationId, (this.#queueGenerations.get(conversationId) ?? 0) + 1)
     const timer = this.#retryTimers.get(conversationId)
     if (timer) {
       clearTimeout(timer)
@@ -2484,43 +2682,63 @@ export class Bridge {
     this.#setRetryAttempt(conversationId, attempt + 1)
     const timer = setTimeout(() => {
       this.#retryTimers.delete(conversationId)
-      void this.#flushQueue(conversationId)
+      void this.#flushQueue(conversationId).catch((error) =>
+        this.#log.warn(`queued flush failed: ${errorText(error)}`),
+      )
     }, delayMs)
     timer.unref?.()
     this.#retryTimers.set(conversationId, timer)
   }
 
-  /** Try to deliver everything queued for a conversation. */
+  /**
+   * Try to deliver everything queued for a conversation.
+   *
+   * The queue is taken out atomically before sending: anything appended while a
+   * send is in flight (a new chunk, a notice, a `/queue clear`) lands in a fresh
+   * queue and is not overwritten when the tail is put back. A per-conversation
+   * mutex keeps two flushes (retry timer + inbound) from sending the same item
+   * twice, and a generation counter makes a `/queue clear` during a flush stick.
+   */
   async #flushQueue(conversationId: string): Promise<void> {
-    const queue = this.#queueFor(conversationId)
-    if (queue.length === 0) {
+    if (this.#flushing.has(conversationId)) return
+    const batch = this.#queueFor(conversationId)
+    if (batch.length === 0) {
       this.#setRetryAttempt(conversationId, 0)
       return
     }
 
-    const remaining: string[] = []
-    for (let index = 0; index < queue.length; index += 1) {
-      if (remaining.length > 0) {
-        remaining.push(queue[index])
-        continue
-      }
-      const refused = await this.#trySend(conversationId, queue[index])
-      if (refused) {
-        this.#log.warn(`queued send still refused (errcode=${refused.errcode})`)
-        remaining.push(queue[index])
-      } else {
+    this.#flushing.add(conversationId)
+    const generation = this.#queueGenerations.get(conversationId) ?? 0
+    this.#setQueue(conversationId, [])
+    let delivered = 0
+    try {
+      for (const item of batch) {
+        const refused = await this.#chain(conversationId, () => this.#trySend(conversationId, item))
+        if (refused) {
+          this.#log.warn(`queued send still refused (errcode=${refused.errcode})`)
+          break
+        }
+        delivered += 1
         this.#log.info("queued send delivered")
       }
+    } finally {
+      this.#flushing.delete(conversationId)
     }
 
+    const remaining = batch.slice(delivered)
+    if (delivered > 0) this.#lastFlushedAt.set(conversationId, Date.now())
+
     if (remaining.length === 0) {
-      this.#setQueue(conversationId, [])
       this.#setRetryAttempt(conversationId, 0)
-      if (queue.length > 0) this.#lastFlushedAt.set(conversationId, Date.now())
+      if (this.#queueFor(conversationId).length > 0) this.#scheduleRetry(conversationId)
       return
     }
 
-    this.#setQueue(conversationId, remaining)
+    // Dropped while we were sending: do not resurrect it.
+    if ((this.#queueGenerations.get(conversationId) ?? 0) !== generation) return
+
+    const appended = this.#queueFor(conversationId)
+    this.#setQueue(conversationId, [...remaining, ...appended].slice(-QUEUE_LIMIT))
     this.#scheduleRetry(conversationId)
   }
 
@@ -2648,28 +2866,31 @@ export function chunkText(text: string, limit: number): string[] {
 
   const push = (piece: string): void => {
     let rest = piece
+    // A chunk that ends inside a fence gets "```\n" appended by `flush`, so that
+    // space belongs to the budget or the chunk overshoots the limit.
+    const closer = (): number => (fence ? 4 : 0)
     while (rest.length > 0) {
       const head = current === "" ? "" : "\n"
-      const room = budget - current.length - head.length
-      if (room <= 0) {
-        flush()
-        continue
-      }
-      if (rest.length <= room) {
+      const room = budget - current.length - head.length - closer()
+      if (room > 0 && rest.length <= room) {
         current += head + rest
         return
       }
-      // The piece does not fit next to what is buffered. Start a fresh chunk
-      // first — unless the piece is longer than a whole chunk, in which case it
-      // cannot fit anywhere and has to be cut.
-      if (current !== "") {
+      // The buffer cannot take the piece, or is already full: close it and try
+      // again — but `flush` reopens a fence as "```", which is not progress, so
+      // flushing a fence-only buffer would loop forever. Only flush real
+      // content, and never when the buffer holds nothing but that marker.
+      const fenceOnly = fence && current === "```"
+      if (current !== "" && !fenceOnly) {
         flush()
         continue
       }
-      const slice = rest.slice(0, budget)
+      // Longer than a whole chunk (or nothing left to flush): cut it, preferring
+      // a break near the cut so words survive.
+      const slice = rest.slice(0, Math.max(room, 1))
       const breakAt = Math.max(slice.lastIndexOf(" "), slice.lastIndexOf("，"), slice.lastIndexOf("、"))
-      const take = breakAt > budget * 0.6 ? breakAt + 1 : budget
-      current = rest.slice(0, take)
+      const take = breakAt > slice.length * 0.6 ? breakAt + 1 : Math.max(room, 1)
+      current += head + rest.slice(0, take)
       flush()
       rest = rest.slice(take)
     }

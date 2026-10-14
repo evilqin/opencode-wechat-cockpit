@@ -13,7 +13,7 @@
 
 import { existsSync, mkdirSync, readFileSync, renameSync, rmSync, writeFileSync } from "node:fs"
 import { homedir } from "node:os"
-import { dirname, join } from "node:path"
+import { join } from "node:path"
 import { randomUUID } from "node:crypto"
 import type { WeixinAccount } from "./ilink.ts"
 
@@ -92,9 +92,39 @@ export interface State {
   lastConversation?: string
   /** Default working directory for sessions created from WeChat. */
   defaultDirectory?: string
+  /**
+   * `wechat_ask` questions waiting for an answer, per conversation.
+   *
+   * Persisted because the tool may run in one plugin instance while the poller
+   * (the instance that receives the reply) is another: the question and its
+   * answer have to travel through the one thing every instance shares.
+   */
+  pendingQuestions?: Record<string, { text: string; askedAt: number; expiresAt: number }>
+  /** Answers written by whichever instance received the reply. */
+  questionAnswers?: Record<string, { text: string; answeredAt: number }>
 }
 
 const EMPTY_STATE: State = { version: 1, contextTokens: {}, bindings: {} }
+
+/**
+ * The last state that was read successfully.
+ *
+ * A read can fail for reasons that have nothing to do with "no state yet" —
+ * EACCES while another instance renames the file, EBUSY, EIO, a torn write.
+ * Returning empty state in those cases used to be catastrophic: `updateState`
+ * would persist that emptiness and destroy credentials, bindings, the poll
+ * cursor and the outbound queue in one go.
+ */
+let lastGoodState: State | undefined
+
+function normalizeState(parsed: Partial<State>): State {
+  return {
+    ...EMPTY_STATE,
+    ...parsed,
+    contextTokens: { ...(parsed.contextTokens ?? {}) },
+    bindings: { ...(parsed.bindings ?? {}) },
+  }
+}
 
 export function ensureStateDir(): void {
   if (!existsSync(STATE_DIR)) mkdirSync(STATE_DIR, { recursive: true })
@@ -103,14 +133,27 @@ export function ensureStateDir(): void {
 export function readState(): State {
   try {
     const parsed = JSON.parse(readFileSync(STATE_PATH, "utf8")) as Partial<State>
-    return {
-      ...EMPTY_STATE,
-      ...parsed,
-      contextTokens: { ...(parsed.contextTokens ?? {}) },
-      bindings: { ...(parsed.bindings ?? {}) },
+    const state = normalizeState(parsed)
+    lastGoodState = state
+    return state
+  } catch (error) {
+    const code = (error as NodeJS.ErrnoException).code
+    // A missing file really is "no state yet".
+    if (code === "ENOENT") return normalizeState({})
+    if (error instanceof SyntaxError) {
+      // Not JSON at all (a torn write from a crash). Keep a copy so nothing is
+      // destroyed silently, then start clean.
+      try {
+        renameSync(STATE_PATH, `${STATE_PATH}.corrupt`)
+      } catch {
+        // Best effort: the next write replaces it anyway.
+      }
+      return normalizeState({})
     }
-  } catch {
-    return { ...EMPTY_STATE, contextTokens: {}, bindings: {} }
+    // A transient IO failure: prefer what we already know over emptiness, and
+    // refuse to invent a state when there is nothing to fall back on.
+    if (lastGoodState) return lastGoodState
+    throw error
   }
 }
 
@@ -227,10 +270,21 @@ export function acquireLock(location: string): LockHandle | undefined {
     if (!claimExclusively(info)) return undefined
   }
 
+  const stillOurs = (): boolean => {
+    try {
+      return readLock()?.instanceId === info.instanceId
+    } catch {
+      return false
+    }
+  }
+
   const refresh = (): void => {
     try {
-      // Never overwrite someone else's lock, and stop claiming a slot we lost.
-      if (lockOwnerInstanceId() !== info.instanceId) return
+      // Compare the instance id only: after a laptop sleep the heartbeat is
+      // stale but the lock may still name us, and a heartbeat that cannot
+      // revive itself would strand the slot (the owner would "lose" a lock
+      // nobody else wants, forcing a needless handover).
+      if (!stillOurs()) return
       info.heartbeat = Date.now()
       writePrivate(LOCK_PATH, JSON.stringify(info))
     } catch {
@@ -248,7 +302,7 @@ export function acquireLock(location: string): LockHandle | undefined {
 
   const touchPolledAt = (at: number): void => {
     try {
-      if (lockOwnerInstanceId() !== info.instanceId) return
+      if (!stillOurs()) return
       info.polledAt = at
       writePrivate(LOCK_PATH, JSON.stringify(info))
     } catch {
@@ -306,8 +360,4 @@ function isDeadProcess(pid: number): boolean {
     // EPERM means the process exists but belongs to someone else.
     return code !== "EPERM"
   }
-}
-
-export function configDir(): string {
-  return dirname(STATE_PATH)
 }

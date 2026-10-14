@@ -234,16 +234,12 @@ export class LocalApi {
     return result.ok ? result.data?.data : undefined
   }
 
-  /** Interactive questions the agent raised, newest first. */
-  async listForms(sessionID?: string): Promise<ApiForm[]> {
-    if (sessionID) {
-      const result = await this.#request<{ data?: ApiForm[] }>(
-        "GET",
-        `/api/session/${encodeURIComponent(sessionID)}/form`,
-      )
-      return result.ok ? (result.data?.data ?? []) : []
-    }
-    const result = await this.#request<{ data?: ApiForm[] }>("GET", "/api/form")
+  /** Interactive questions the agent raised for one session, newest first. */
+  async listForms(sessionID: string): Promise<ApiForm[]> {
+    const result = await this.#request<{ data?: ApiForm[] }>(
+      "GET",
+      `/api/session/${encodeURIComponent(sessionID)}/form`,
+    )
     return result.ok ? (result.data?.data ?? []) : []
   }
 
@@ -261,14 +257,6 @@ export class LocalApi {
       "POST",
       `/api/session/${encodeURIComponent(sessionID)}/form/${encodeURIComponent(formID)}/reply`,
       { answer },
-    )
-    return result.ok
-  }
-
-  async cancelForm(sessionID: string, formID: string): Promise<boolean> {
-    const result = await this.#request<unknown>(
-      "DELETE",
-      `/api/session/${encodeURIComponent(sessionID)}/form/${encodeURIComponent(formID)}`,
     )
     return result.ok
   }
@@ -298,7 +286,4 @@ export class LocalApi {
     if (!result.ok || !result.data) return undefined
     return { version: result.data.version, pid: result.data.pid, url: info?.url }
   }
-
-  /** Last failure reason, for diagnostics. */
-  lastError?: string
 }

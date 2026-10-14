@@ -273,13 +273,39 @@ export async function apiCall<T>(request: ApiRequest): Promise<T> {
   return parseWireJson<T>(await apiCallRaw(request))
 }
 
+/**
+ * Call an endpoint that may answer with an empty body.
+ *
+ * `apiCall` parses JSON, so a 200 with no body throws a syntax error that looks
+ * like a transport failure; these endpoints (typing, notify) report refusals
+ * through `ret`/`errcode` instead, and that is worth surfacing.
+ */
+export async function apiCallVoid(request: ApiRequest): Promise<void> {
+  const raw = await apiCallRaw(request)
+  if (!raw.trim()) return
+  const response = parseWireJson<{ ret?: number; errcode?: number; errmsg?: string }>(raw)
+  const code = response.errcode ?? response.ret
+  if (code !== undefined && code !== 0) {
+    throw new Error(`${request.endpoint} 失败 ret=${response.ret} errcode=${response.errcode} errmsg=${response.errmsg ?? ""}`)
+  }
+}
+
 function combineSignals(a?: AbortSignal, b?: AbortSignal): AbortSignal | undefined {
   if (a === undefined) return b
   if (b === undefined) return a
   if (a.aborted) return a
   if (b.aborted) return b
+  // `AbortSignal.any` keeps no listener of its own on the source signals, and
+  // that matters here: the monitor hands the same long-lived signal to every
+  // poll, so manual listeners used to accumulate one per request for the whole
+  // process lifetime (thousands after a day of running).
+  if (typeof AbortSignal.any === "function") return AbortSignal.any([a, b])
   const controller = new AbortController()
-  const onAbort = (): void => controller.abort()
+  const onAbort = (): void => {
+    a.removeEventListener("abort", onAbort)
+    b.removeEventListener("abort", onAbort)
+    controller.abort()
+  }
   a.addEventListener("abort", onAbort, { once: true })
   b.addEventListener("abort", onAbort, { once: true })
   return controller.signal
@@ -316,6 +342,14 @@ export interface LoginOptions {
   signal?: AbortSignal
   /** Called for every step, so callers can render or log progress. */
   onEvent?: (event: LoginEvent) => void
+  /**
+   * Called when an event handler rejects.
+   *
+   * Handlers are async (writing the QR image, saving the account) and used to be
+   * fired without awaiting, so a rejection became an unhandled one that could
+   * take the host process down. The failure is reported here instead.
+   */
+  onEventError?: (error: unknown) => void
   /**
    * Asked when the server wants a pairing verification code.
    *
@@ -376,7 +410,23 @@ export async function pollQRStatus(params: {
 export async function login(options: LoginOptions = {}): Promise<LoginResult> {
   const deadline = Date.now() + (options.timeoutMs ?? 5 * 60_000)
   const localTokenList = [...(options.existingTokens ?? [])]
-  const emit = (event: LoginEvent): void => options.onEvent?.(event)
+  // Events are delivered one at a time: handlers do real work (writing the QR
+  // image, saving the account) and are async, so firing them concurrently both
+  // reorders those side effects and — before this — let a rejection escape.
+  let emission: Promise<void> = Promise.resolve()
+  const emit = (event: LoginEvent): void => {
+    const handler = options.onEvent
+    if (!handler) return
+    emission = emission
+      .then(
+        () => handler(event),
+        () => handler(event),
+      )
+      .then(
+        () => undefined,
+        (error) => options.onEventError?.(error),
+      )
+  }
 
   let baseUrl = options.baseUrl ?? FIXED_BASE_URL
   let qr: QRCodeResponse
@@ -428,7 +478,13 @@ export async function login(options: LoginOptions = {}): Promise<LoginResult> {
           return { alreadyBound: false, reason }
         }
         emit({ kind: "verifycode-required", attempt: verifyAttempt })
-        verifyCode = await options.requestVerifyCode?.(verifyAttempt)
+        try {
+          verifyCode = await options.requestVerifyCode?.(verifyAttempt)
+        } catch {
+          // A collector that fails is the same as one that cannot collect: say
+          // so instead of letting the rejection escape the login flow.
+          verifyCode = undefined
+        }
         if (!verifyCode) {
           const reason = "需要输入配对验证码，但当前环境无法交互输入"
           emit({ kind: "failed", reason })
@@ -452,7 +508,15 @@ export async function login(options: LoginOptions = {}): Promise<LoginResult> {
           emit({ kind: "failed", reason })
           return { alreadyBound: false, reason }
         }
-        qr = await fetchQRCode({ localTokenList, botType: options.botType, baseUrl, signal: options.signal })
+        try {
+          qr = await fetchQRCode({ localTokenList, botType: options.botType, baseUrl, signal: options.signal })
+        } catch (error) {
+          // A transient network blip mid-scan must end the flow with a reason,
+          // not with an exception nobody catches.
+          const reason = `刷新二维码失败：${errorMessage(error)}`
+          emit({ kind: "failed", reason })
+          return { alreadyBound: false, reason }
+        }
         emit({ kind: "qr", qrUrl: qr.qrcode_img_content, qrcode: qr.qrcode, refreshed: true })
         scannedNotified = false
         verifyCode = undefined
@@ -535,6 +599,14 @@ export function assertSendAccepted(response: SendMessageResp): void {
   throw new SendRefusedError(`发送被微信拒绝：errcode=${String(code)} errmsg=${response.errmsg ?? "(无)"}`, code)
 }
 
+/**
+ * Longest text the service accepts in one message.
+ *
+ * The official outbound config uses 4000; anything longer is truncated by the
+ * server, which on the phone looks exactly like the model stopping mid-reply.
+ */
+export const MAX_TEXT_CHARS = 4_000
+
 export interface SendTextParams {
   account: WeixinAccount
   to: string
@@ -546,6 +618,12 @@ export interface SendTextParams {
 
 /** Send one text message. Throws `SendRefusedError` when the service refuses it. */
 export async function sendText(params: SendTextParams): Promise<{ clientId: string; serverMessageId?: string }> {
+  const text = params.text ?? ""
+  // Refuse here rather than let the service cut the tail off silently.
+  if (text.trim().length === 0) throw new Error("不能发送空消息")
+  if (text.length > MAX_TEXT_CHARS) {
+    throw new Error(`单条消息 ${text.length} 字符，超过服务端上限 ${MAX_TEXT_CHARS}`)
+  }
   const clientId = newClientId()
   const response = await apiCall<SendMessageResp>({
     baseUrl: params.account.baseUrl,
@@ -557,7 +635,7 @@ export async function sendText(params: SendTextParams): Promise<{ clientId: stri
         client_id: clientId,
         message_type: MessageType.BOT,
         message_state: MessageState.FINISHED,
-        item_list: params.text ? [{ type: ItemType.TEXT, text_item: { text: params.text } }] : undefined,
+        item_list: [{ type: ItemType.TEXT, text_item: { text } }],
         ...(params.contextToken === undefined ? {} : { context_token: params.contextToken }),
         ...(params.runId === undefined ? {} : { run_id: params.runId }),
       },
@@ -579,6 +657,7 @@ export async function getTypingTicket(params: {
   account: WeixinAccount
   userId: string
   contextToken?: string
+  signal?: AbortSignal
 }): Promise<string | undefined> {
   const response = await apiCall<GetConfigResp>({
     baseUrl: params.account.baseUrl,
@@ -590,7 +669,14 @@ export async function getTypingTicket(params: {
     },
     token: params.account.token,
     timeoutMs: 10_000,
+    signal: params.signal,
   })
+  // A refusal used to be invisible here: the caller just got "no ticket" and the
+  // indicator stayed off forever without a single log line.
+  const code = response.errcode ?? response.ret
+  if (code !== undefined && code !== 0) {
+    throw new Error(`getconfig 失败 ret=${response.ret} errcode=${response.errcode} errmsg=${response.errmsg ?? ""}`)
+  }
   return response.typing_ticket
 }
 
@@ -599,8 +685,9 @@ export async function sendTyping(params: {
   userId: string
   ticket: string
   typing: boolean
+  signal?: AbortSignal
 }): Promise<void> {
-  await apiCall({
+  await apiCallVoid({
     baseUrl: params.account.baseUrl,
     endpoint: "ilink/bot/sendtyping",
     body: {
@@ -611,11 +698,12 @@ export async function sendTyping(params: {
     },
     token: params.account.token,
     timeoutMs: 10_000,
+    signal: params.signal,
   })
 }
 
 export async function notifyStart(account: WeixinAccount): Promise<void> {
-  await apiCall({
+  await apiCallVoid({
     baseUrl: account.baseUrl,
     endpoint: "ilink/bot/msg/notifystart",
     body: { base_info: baseInfo() },
@@ -781,7 +869,7 @@ export async function sendItems(params: {
 
 export async function notifyStop(account: WeixinAccount): Promise<void> {
   try {
-    await apiCall({
+    await apiCallVoid({
       baseUrl: account.baseUrl,
       endpoint: "ilink/bot/msg/notifystop",
       body: { base_info: baseInfo() },
@@ -809,15 +897,6 @@ export function isMediaItem(item: MessageItem): boolean {
 }
 
 /** Concatenate text items plus any server-side voice transcript. */
-export function extractText(message: WeixinMessage): string {
-  const parts: string[] = []
-  for (const item of message.item_list ?? []) {
-    if (item.type === ItemType.TEXT && item.text_item?.text) parts.push(item.text_item.text)
-    // Inbound voice usually carries a server-side transcript.
-    else if (item.type === ItemType.VOICE && item.voice_item?.text) parts.push(item.voice_item.text)
-  }
-  return parts.join("\n").trim()
-}
 
 function errorMessage(error: unknown): string {
   return error instanceof Error ? error.message : String(error)
@@ -829,6 +908,13 @@ function isAbort(error: unknown): boolean {
 
 export function sleep(ms: number, signal?: AbortSignal): Promise<void> {
   return new Promise((resolve) => {
+    // Already aborted: the `abort` event fired before the listener existed, so
+    // waiting the full duration would ignore the cancellation (up to 30s in the
+    // monitor's backoff path).
+    if (signal?.aborted) {
+      resolve()
+      return
+    }
     const timer = setTimeout(done, ms)
     function done(): void {
       clearTimeout(timer)

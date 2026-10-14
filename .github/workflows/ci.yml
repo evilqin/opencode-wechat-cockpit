@@ -33,3 +33,8 @@ jobs:
         run: |
           mkdir -p "$WECHAT_STATE_DIR"
           bun test
+
+      - name: 手册与代码同源（MANUAL.md 无漂移）
+        run: |
+          bun gen-manual.ts
+          git diff --exit-code -- MANUAL.md

@@ -6,8 +6,8 @@
  *    server's suggestion so the server always wins the race;
  *  - the cursor is persisted *before* the batch is dispatched, so a crash
  *    mid-handling replays instead of dropping messages;
- *  - `errcode -14` pauses the account for an hour rather than hammering an
- *    endpoint that cannot succeed until the user re-binds;
+ *  - `errcode -14` stops the pump and reports a stale token, which is the only
+ *    thing the user can act on (a fresh QR scan);
  *  - other failures retry, then back off.
  */
 
@@ -15,9 +15,9 @@ import {
   apiCall,
   baseInfo,
   DEFAULT_LONG_POLL_TIMEOUT_MS,
+  ItemType,
   MessageType,
   STALE_TOKEN_ERRCODE,
-  SESSION_PAUSE_MS,
   RETRY_DELAY_MS,
   BACKOFF_DELAY_MS,
   MAX_CONSECUTIVE_FAILURES,
@@ -95,7 +95,6 @@ export class ChannelMonitor {
   #syncBuf: string
   #longPollTimeoutMs = DEFAULT_LONG_POLL_TIMEOUT_MS
   #consecutiveFailures = 0
-  #pausedUntil = 0
   /** When the last long poll came back, for the poller watchdog. */
   #lastActivityAt = Date.now()
   /** Consecutive polls that ended by client-side timeout. */
@@ -140,14 +139,6 @@ export class ChannelMonitor {
     return this.#syncBuf
   }
 
-  get paused(): boolean {
-    return Date.now() < this.#pausedUntil
-  }
-
-  get remainingPauseMs(): number {
-    return Math.max(0, this.#pausedUntil - Date.now())
-  }
-
   /** Run until aborted or the token goes stale. */
   async run(signal: AbortSignal): Promise<MonitorStopReason> {
     const { account } = this.#options
@@ -156,10 +147,6 @@ export class ChannelMonitor {
       if (!this.#stillOwned()) {
         this.#options.onStop?.("aborted", "不再持有轮询锁，自行退出")
         return "aborted"
-      }
-      if (this.paused) {
-        await sleep(this.remainingPauseMs, signal)
-        continue
       }
 
       let response: GetUpdatesResp
@@ -181,7 +168,6 @@ export class ChannelMonitor {
       const code = response.errcode ?? response.ret
       if (code !== undefined && code !== 0) {
         if (code === STALE_TOKEN_ERRCODE) {
-          this.#pausedUntil = Date.now() + SESSION_PAUSE_MS
           this.#options.onStop?.("stale-token", "bot token 已失效，需要重新扫码绑定")
           return "stale-token"
         }
@@ -205,10 +191,22 @@ export class ChannelMonitor {
       // Persist the cursor before dispatch: a crash while handling replays the batch.
       if (response.get_updates_buf) {
         this.#syncBuf = response.get_updates_buf
-        await this.#options.onSyncBuf?.(this.#syncBuf)
+        try {
+          await this.#options.onSyncBuf?.(this.#syncBuf)
+        } catch (error) {
+          // A failed cursor write must not kill the pump: the next poll retries.
+          this.#options.onError?.(error)
+        }
       }
 
       for (const raw of response.msgs ?? []) {
+        // Ownership can change mid-batch (a handover, a hot reload). A disowned
+        // poller must stop dispatching, or the rest of the batch is handled
+        // twice — the exact race the pre-batch check exists to prevent.
+        if (!this.#stillOwned()) {
+          this.#options.onStop?.("aborted", "不再持有轮询锁，放弃本批剩余消息")
+          return "aborted"
+        }
         const inbound = toInbound(account, raw)
         if (!inbound) continue
         try {
@@ -304,8 +302,8 @@ export function toInbound(account: WeixinAccount, raw: WeixinMessage): InboundMe
 function extractItemsText(message: WeixinMessage): string {
   const parts: string[] = []
   for (const item of message.item_list ?? []) {
-    if (item.type === 1 && item.text_item?.text) parts.push(item.text_item.text)
-    else if (item.type === 3 && item.voice_item?.text) parts.push(item.voice_item.text)
+    if (item.type === ItemType.TEXT && item.text_item?.text) parts.push(item.text_item.text)
+    else if (item.type === ItemType.VOICE && item.voice_item?.text) parts.push(item.voice_item.text)
   }
   return parts.join("\n").trim()
 }

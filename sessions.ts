@@ -138,17 +138,19 @@ export function formatModelList(models: ModelSummary[], current?: { providerID: 
 export function resolveModelTarget(models: ModelSummary[], argument: string): ModelSummary | undefined {
   const value = argument.trim()
   if (!value) return undefined
+  // Numbering, listing and lookup share one filtered list — and the same display
+  // cap — so an index nobody could have read off the list is not accepted.
+  const usable = models.filter((model) => model.enabled !== false)
 
   const index = Number.parseInt(value, 10)
   if (Number.isFinite(index) && String(index) === value) {
-    const usable = models.filter((model) => model.enabled !== false)
-    return usable[index - 1]
+    return index >= 1 && index <= MAX_MODELS_SHOWN ? usable[index - 1] : undefined
   }
 
-  const exact = models.find((model) => `${model.providerID}/${model.id}` === value || model.id === value)
+  const exact = usable.find((model) => `${model.providerID}/${model.id}` === value || model.id === value)
   if (exact) return exact
   const lowered = value.toLowerCase()
-  const byName = models.filter((model) => model.id.toLowerCase().includes(lowered))
+  const byName = usable.filter((model) => model.id.toLowerCase().includes(lowered))
   return byName.length === 1 ? byName[0] : undefined
 }
 
@@ -171,11 +173,13 @@ export function formatAgentList(agents: AgentSummary[], current?: string): strin
 export function resolveAgentTarget(agents: AgentSummary[], argument: string): AgentSummary | undefined {
   const value = argument.trim()
   if (!value) return undefined
+  // The same filtered list backs numbering, listing and lookup: `/agent helper`
+  // must not switch to an agent the list deliberately hides.
   const usable = agents.filter((agent) => agent.hidden !== true && agent.mode !== "subagent")
 
   const index = Number.parseInt(value, 10)
   if (Number.isFinite(index) && String(index) === value) return usable[index - 1]
-  return agents.find((agent) => agent.id === value || agent.name === value)
+  return usable.find((agent) => agent.id === value || agent.name === value)
 }
 
 /*

@@ -24,10 +24,21 @@ import {
   unwrapList,
 } from "../sessions.ts"
 import { ChannelMonitor, conversationKey } from "../monitor.ts"
-import { buildMediaRef, parseWireJson, newClientId, assertSendAccepted, SendRefusedError } from "../ilink.ts"
-import { LOCK_PATH, acquireLock, ensureStateDir } from "../state.ts"
+import {
+  MAX_TEXT_CHARS,
+  buildMediaRef,
+  parseWireJson,
+  newClientId,
+  assertSendAccepted,
+  sendText,
+  sleep,
+  SendRefusedError,
+} from "../ilink.ts"
+import { MAX_DOWNLOAD_BYTES, fetchMedia, pruneInbox } from "../media.ts"
+import { LOCK_PATH, STATE_DIR, STATE_PATH, acquireLock, ensureStateDir, readState } from "../state.ts"
 import { randomBytes } from "node:crypto"
-import { rmSync, writeFileSync } from "node:fs"
+import { existsSync, mkdirSync, rmSync, utimesSync, writeFileSync } from "node:fs"
+import { join } from "node:path"
 
 describe("chunkText", () => {
   test("keeps short text intact", () => {
@@ -401,6 +412,102 @@ describe("wire format", () => {
  * Poller lock
  * ---------------------------------------------------------------------------
  */
+
+/*
+ * ---------------------------------------------------------------------------
+ * Hardening (audit follow-up)
+ * ---------------------------------------------------------------------------
+ */
+
+describe("chunking edge cases", () => {
+  test("a long line inside a code fence does not loop forever", () => {
+    // Regression: the fence-reopen guard used to flush a fence-only buffer and
+    // restore the same state, so this input spun until the process was killed.
+    const blob = "x".repeat(1000)
+    const text = ["```js", blob, "```"].join("\n")
+    const chunks = chunkText(text, 120)
+    expect(chunks.length).toBeGreaterThan(1)
+    expect(chunks.length).toBeLessThan(30)
+    // "```\n" is appended when a chunk closes inside a fence.
+    expect(chunks.every((chunk) => chunk.length <= 124)).toBe(true)
+    expect(chunks[0]!.startsWith("```js")).toBe(true)
+  })
+})
+
+describe("wire guards", () => {
+  test("sendText refuses an empty or oversized message before any request", async () => {
+    const account = { accountId: "bot@im.bot", token: "t", baseUrl: "http://127.0.0.1:1" }
+    await expect(sendText({ account, to: "user@im.wechat", text: "   " })).rejects.toThrow("空")
+    await expect(sendText({ account, to: "user@im.wechat", text: "x".repeat(MAX_TEXT_CHARS + 1) })).rejects.toThrow(
+      "上限",
+    )
+  })
+
+  test("sleep resolves immediately on an already-aborted signal", async () => {
+    const controller = new AbortController()
+    controller.abort()
+    const started = Date.now()
+    await sleep(5_000, controller.signal)
+    expect(Date.now() - started).toBeLessThan(100)
+  })
+
+  test("an approval selector refuses what it cannot parse", () => {
+    expect(parseSelector("2")).toEqual({ index: 2, all: false })
+    expect(parseSelector("all")).toEqual({ all: true })
+    expect(parseSelector("2x").invalid).toBe(true)
+    expect(parseSelector("abc").invalid).toBe(true)
+    expect(parseSelector("0").invalid).toBe(true)
+  })
+})
+
+describe("media hardening", () => {
+  test("a download larger than the budget is refused, not buffered", async () => {
+    const { createServer } = await import("node:http")
+    const server = createServer((_request, response) => {
+      response.writeHead(200, { "content-type": "application/octet-stream" })
+      response.end(Buffer.alloc(2048, 7))
+    })
+    await new Promise<void>((resolve) => {
+      server.listen(0, "127.0.0.1", () => resolve())
+    })
+    const address = server.address()
+    const port = typeof address === "object" && address ? address.port : 0
+    const ref = { full_url: `http://127.0.0.1:${port}/attachment` }
+
+    expect(MAX_DOWNLOAD_BYTES).toBeGreaterThan(1024 * 1024)
+    await expect(fetchMedia({ ref, maxBytes: 1024 })).resolves.toBeUndefined()
+    const fits = await fetchMedia({ ref, maxBytes: 4096 })
+    expect(fits?.byteLength).toBe(2048)
+
+    const closeable = server as unknown as { closeAllConnections?: () => void }
+    closeable.closeAllConnections?.()
+    server.close()
+  })
+
+  test("the inbox keeps recent attachments and drops old ones", () => {
+    ensureStateDir()
+    const inbox = join(STATE_DIR, "inbox")
+    mkdirSync(inbox, { recursive: true })
+    const fresh = join(inbox, "fresh.bin")
+    const old = join(inbox, "old.bin")
+    writeFileSync(fresh, "new")
+    writeFileSync(old, "old")
+    const longAgo = (Date.now() - 30 * 24 * 60 * 60 * 1000) / 1000
+    utimesSync(old, longAgo, longAgo)
+
+    expect(pruneInbox()).toBeGreaterThanOrEqual(1)
+    expect(existsSync(fresh)).toBe(true)
+    expect(existsSync(old)).toBe(false)
+  })
+
+  test("a corrupt state file is backed up instead of silently erased", () => {
+    ensureStateDir()
+    writeFileSync(STATE_PATH, "{ not json")
+    expect(readState().bindings).toEqual({})
+    expect(existsSync(`${STATE_PATH}.corrupt`)).toBe(true)
+    rmSync(`${STATE_PATH}.corrupt`, { force: true })
+  })
+})
 
 describe("poller lock", () => {
   const writeLock = (info: Record<string, unknown>): void => {
