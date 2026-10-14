@@ -129,9 +129,7 @@ function describe(item: MessageItem):
     }
   }
   return undefined
-}
-
-function short(value: string): string {
+}function short(value: string): string {
   return createHash("sha1").update(value).digest("hex").slice(0, 8)
 }
 

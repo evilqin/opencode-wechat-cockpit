@@ -9,7 +9,7 @@
  * a script if desired.
  */
 
-import { existsSync, readFileSync, statSync } from "node:fs"
+import { existsSync, readdirSync, readFileSync, statSync } from "node:fs"
 import { join } from "node:path"
 
 import { CONFIG_PATH, readConfig } from "./config.ts"
@@ -34,18 +34,22 @@ async function main(): Promise<void> {
   if (!existsSync(STATE_PATH)) problems.push("还没登录：运行 bun login-cli.ts 扫码")
 
   /* ---- dependencies ---- */
+  const state = readState()
   for (const dependency of ["qrcode", "qrcode-terminal"]) {
     try {
       await import(dependency)
       line(`依赖 ${dependency}`, "可用")
     } catch {
       line(`依赖 ${dependency}`, "缺失")
-      problems.push(`缺少依赖 ${dependency}：在 ~/.config/opencode 下执行 bun install`)
+      // They are only needed to draw the login QR (the login falls back to a raw
+      // link), so an already-logged-in channel works without them.
+      const advice = `缺少依赖 ${dependency}：在 ~/.config/opencode 下执行 bun add qrcode qrcode-terminal`
+      if (state.account?.token) notes.push(advice)
+      else problems.push(advice)
     }
   }
 
   /* ---- login ---- */
-  const state = readState()
   const account = state.account
   if (account) {
     line("机器人", account.accountId)
@@ -76,7 +80,28 @@ async function main(): Promise<void> {
   line("新会话模型", config.model || "跟随默认")
   line("新会话 agent", config.agent || "跟随默认")
 
+  /* ---- queue / inbox ---- */
+  const queued = Object.values(state.pendingOutbound ?? {}).reduce((sum, list) => sum + list.length, 0)
+  line("待发队列", queued > 0 ? `${queued} 条（你下一条消息会触发补发）` : "空")
+  const inbox = join(STATE_DIR, "inbox")
+  if (existsSync(inbox)) {
+    let bytes = 0
+    let files = 0
+    for (const name of readdirSync(inbox)) {
+      try {
+        const stats = statSync(join(inbox, name))
+        if (!stats.isFile()) continue
+        bytes += stats.size
+        files += 1
+      } catch {
+        // A racing delete is fine.
+      }
+    }
+    line("附件收件箱", `${files} 个文件，${(bytes / 1024 / 1024).toFixed(1)} MB（保留 14 天 / 512MB）`)
+  }
+
   /* ---- lock ---- */
+  let noLock = false
   if (existsSync(LOCK_PATH)) {
     try {
       const lock = JSON.parse(readFileSync(LOCK_PATH, "utf8")) as {
@@ -84,26 +109,38 @@ async function main(): Promise<void> {
         location: string
         heartbeat: number
         polledAt?: number
+        answeredAt?: number
+        timeouts?: number
       }
       const ageSeconds = Math.round((Date.now() - lock.heartbeat) / 1000)
       const pollAge =
         typeof lock.polledAt === "number" ? Math.round((Date.now() - lock.polledAt) / 1000) : undefined
+      // `polledAt` advances on every turn of the loop, including silent client
+      // timeouts; `answeredAt` only moves when the server actually answered, so
+      // it is the field that spots a network which is dropping traffic.
+      const answerAge =
+        typeof lock.answeredAt === "number" ? Math.round((Date.now() - lock.answeredAt) / 1000) : undefined
+      const timeouts = typeof lock.timeouts === "number" ? lock.timeouts : 0
       line(
         "轮询锁",
         `pid=${lock.pid} ${lock.location}（心跳 ${ageSeconds} 秒前${
-          pollAge === undefined ? "，未记录轮询时间" : `，上次完成长轮询 ${pollAge} 秒前`
+          pollAge === undefined ? "" : `，循环 ${pollAge} 秒前动过`
+        }${answerAge === undefined ? "" : `，服务端应答 ${answerAge} 秒前`}${
+          timeouts > 0 ? `，连续 ${timeouts} 次无应答` : ""
         }）`,
       )
       if (ageSeconds > 120) notes.push("轮询锁看起来已经过期，下次 tick（10 秒内）会被自动接管")
-      else if (pollAge !== undefined && pollAge > 120) {
-        notes.push("锁的心跳在跑但很久没有完成过长轮询：另一个实例会在 2 分钟内接管并重启它")
+      if (timeouts >= 3 || (answerAge !== undefined && answerAge > 120)) {
+        notes.push("连续多次长轮询没有应答：网络可能在丢包（门户认证掉了？），看 bridge.log 的 poll 日志")
+      } else if (pollAge !== undefined && pollAge > 120) {
+        notes.push("锁的心跳在跑但轮询循环很久没动：另一个实例会在 2 分钟内接管并重启它")
       }
     } catch {
       line("轮询锁", "存在但无法解析（会被自动清理）")
     }
   } else {
-    line("轮询锁", "无人持有（opencode 没在跑，或插件还没加载）")
-    notes.push("opencode 服务没在运行时，微信消息会留在腾讯服务端，等它重连后按游标补发")
+    line("轮询锁", "无人持有")
+    noLock = true
   }
 
   /* ---- local API ---- */
@@ -112,12 +149,18 @@ async function main(): Promise<void> {
   const info = await api.info()
   if (info) {
     line("本地 API", `可用 v${info.version ?? "?"} ${info.url ?? ""}`)
+    if (noLock) {
+      // The service is alive but no instance holds the lock: the plugin is not
+      // loaded, which is exactly the "channel went deaf" incident.
+      problems.push("opencode 服务在跑，却没有任何实例持有轮询锁：插件没有加载（看服务日志里的 plugin 报错）")
+    }
     const sessions = await api.listSessions({ limit: 3 })
     line("会话可见", `最近 ${sessions.length} 个（/list 用得到）`)
     notes.push("自检是独立进程，所以永远不是「本进程」；插件在 opencode 服务里运行时会自己认出来")
   } else {
     line("本地 API", "不可用")
     notes.push("本地 API 不可用时：/list 只列微信建过的会话，agent 的提问需要回电脑回答")
+    notes.push("opencode 服务没在运行时，微信消息会留在腾讯服务端，等它重连后按游标补发")
   }
 
   /* ---- log ---- */

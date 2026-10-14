@@ -40,6 +40,8 @@ interface ILinkMock {
   delivered: string[]
   /** While true, sendmessage answers the way a closed reply window does. */
   refuseSends: boolean
+  /** While true, only sends carrying a `context_token` are refused. */
+  refuseContextTokens: boolean
   server: Server
 }
 
@@ -49,6 +51,7 @@ async function startILink(): Promise<ILinkMock> {
     attempts: [],
     delivered: [],
     refuseSends: false,
+    refuseContextTokens: false,
     server: undefined as unknown as Server,
   }
 
@@ -72,11 +75,13 @@ async function startILink(): Promise<ILinkMock> {
 
       if (path === "POST /ilink/bot/sendmessage") {
         mock.attempts.push({ path, body })
-        if (mock.refuseSends) {
+        const msg = body.msg as
+          | { context_token?: string; item_list?: Array<{ text_item?: { text?: string } }> }
+          | undefined
+        if (mock.refuseSends || (mock.refuseContextTokens && msg?.context_token)) {
           json({ ret: -2, errmsg: "prepare failed" })
           return
         }
-        const msg = body.msg as { item_list?: Array<{ text_item?: { text?: string } }> } | undefined
         mock.delivered.push(msg?.item_list?.[0]?.text_item?.text ?? "")
         json({ ret: 0, message_id: "7514975623787282440" })
         return
@@ -315,12 +320,12 @@ const apiMock = await startApi()
 /**
  * Paths this suite writes to.
  *
- * The preload normally sets both variables, but bun decides the file order per
- * platform and a later suite's cleanup must not be able to empty them — so the
- * values (and temp-dir fallbacks) are captured once, here, at import time.
+ * The service file is always our own: with a user-set `WECHAT_SERVICE_FILE` the
+ * preload would respect it and the harness would overwrite a real registration.
  */
-const TEST_SERVICE_FILE =
-  process.env.WECHAT_SERVICE_FILE ?? join(mkdtempSync(join(tmpdir(), "wechat-service-")), "service.json")
+const TEST_SERVICE_FILE = join(mkdtempSync(join(tmpdir(), "wechat-service-")), "service.json")
+process.env.WECHAT_SERVICE_FILE = TEST_SERVICE_FILE
+/** The shared state directory the preload set up. */
 const TEST_STATE_DIR = process.env.WECHAT_STATE_DIR ?? mkdtempSync(join(tmpdir(), "wechat-state-"))
 
 // A registration file for the plugin client to read (tests must never reach the
@@ -397,6 +402,22 @@ function sentTexts(): string[] {
 function clearSent(): void {
   ilink.attempts.length = 0
   ilink.delivered.length = 0
+}
+
+/**
+ * Wait until a condition holds (or fail after a deadline).
+ *
+ * Fixed sleeps flip on a loaded CI box: the assertion runs before the timer it
+ * depends on. Waiting on the observable outcome instead is both faster and
+ * stable.
+ */
+async function waitFor(condition: () => boolean, timeoutMs = 2_000, label = "condition"): Promise<void> {
+  const deadline = Date.now() + timeoutMs
+  while (Date.now() < deadline) {
+    if (condition()) return
+    await new Promise((resolve) => setTimeout(resolve, 5))
+  }
+  throw new Error(`timed out waiting for ${label}`)
 }
 
 const DEFAULT_SESSIONS = [
@@ -973,8 +994,18 @@ describe("approvals", () => {
     resources,
   })
 
-  /** Approvals are announced after a short burst window. */
-  const settle = () => new Promise((resolve) => setTimeout(resolve, 60))
+  /**
+   * Approvals are announced after a short burst window: wait for the message
+   * rather than guessing a duration. `settle(0)` is for the case where nothing
+   * may be announced — it gives the window time to (not) fire.
+   */
+  const settle = async (expected = 1): Promise<void> => {
+    if (expected === 0) {
+      await new Promise((resolve) => setTimeout(resolve, 80))
+      return
+    }
+    await waitFor(() => sentTexts().length >= expected, 2_000, "approval announcement")
+  }
 
   test("a request is pushed with numbered options", async () => {
     const { bridge } = await harness()
@@ -1053,7 +1084,7 @@ describe("approvals", () => {
     await bridge.handleInbound(inbound("/new 我的会话"))
     clearSent()
     await bridge.handleEvent({ type: "permission.asked", data: { ...permission("per_9"), sessionID: "ses_other" } })
-    await settle()
+    await settle(0)
     expect(sentTexts().length).toBe(0)
   })
 })
@@ -1178,7 +1209,7 @@ describe("replies back to WeChat", () => {
     // Nothing yet: the grace window exists so the turn's blocks can merge.
     expect(sentTexts().length).toBe(0)
 
-    await new Promise((resolve) => setTimeout(resolve, 80))
+    await waitFor(() => sentTexts().length > 0, 2_000, "grace delivery")
     expect(sentTexts()).toEqual(["没有 idle 的答案"])
   })
 
@@ -1192,7 +1223,9 @@ describe("replies back to WeChat", () => {
       data: { sessionID: "ses_test1", assistantMessageID: "msg_1", ordinal: 0, text: "只发一次" },
     })
     await bridge.handleEvent({ type: "session.idle", data: { sessionID: "ses_test1" } })
-    await new Promise((resolve) => setTimeout(resolve, 90))
+    await waitFor(() => sentTexts().length > 0, 2_000, "turn delivery")
+    // Give the grace timer time to (not) send a second copy.
+    await new Promise((resolve) => setTimeout(resolve, 60))
 
     expect(sentTexts()).toEqual(["只发一次"])
   })
@@ -1398,8 +1431,7 @@ describe("the reply window", () => {
 
     // Two short retries, then parked: hammering a closed window forever is what
     // produced a storm of stale messages before this existed.
-    await new Promise((resolve) => setTimeout(resolve, 120))
-    expect(logs.some((line) => line.includes("parked"))).toBe(true)
+    await waitFor(() => logs.some((line) => line.includes("parked")), 2_000, "parked log")
     const attemptsAfterParking = readState().pendingOutboundAttempts?.[CONVERSATION]
     await new Promise((resolve) => setTimeout(resolve, 80))
     expect(readState().pendingOutboundAttempts?.[CONVERSATION]).toBe(attemptsAfterParking)
@@ -1443,8 +1475,7 @@ describe("wechat_ask", () => {
     clearSent()
 
     const pending = bridge.ask(CONVERSATION, "要发布吗？", 5_000)
-    await new Promise((resolve) => setTimeout(resolve, 30))
-    expect(sentTexts().join("\n")).toContain("要发布吗？")
+    await waitFor(() => sentTexts().some((text) => text.includes("要发布吗？")), 2_000, "question delivery")
 
     await bridge.handleInbound(inbound("先别发布"))
     expect(await pending).toBe("先别发布")
@@ -1457,7 +1488,7 @@ describe("wechat_ask", () => {
     const { bridge } = await harness()
     await bridge.handleInbound(inbound("/new 我的会话"))
     const pending = bridge.ask(CONVERSATION, "第一个问题", 5_000)
-    await new Promise((resolve) => setTimeout(resolve, 20))
+    await waitFor(() => readState().pendingQuestions?.[CONVERSATION] !== undefined, 2_000, "question registered")
     expect(await bridge.ask(CONVERSATION, "第二个问题", 5_000)).toContain("已经有一个问题")
     await bridge.handleInbound(inbound("答案"))
     await pending
@@ -1747,8 +1778,7 @@ describe("hardening (audit follow-up)", () => {
     clearSent()
 
     const answer = first.bridge.ask(CONVERSATION, "选哪个？", 5_000)
-    await new Promise((resolve) => setTimeout(resolve, 50))
-    expect(readState().pendingQuestions?.[CONVERSATION]?.text).toBe("选哪个？")
+    await waitFor(() => readState().pendingQuestions?.[CONVERSATION]?.text === "选哪个？", 2_000, "question in state")
 
     // The instance that owns the poller may be a different one: it records the
     // reply in shared state, and the asking instance resolves by watching it.
@@ -1780,12 +1810,12 @@ describe("hardening (audit follow-up)", () => {
       type: "permission.asked",
       data: { id: "per_a", sessionID: "ses_test1", action: "bash", resources: ["rm -rf build"] },
     })
-    await new Promise((resolve) => setTimeout(resolve, 60))
+    await waitFor(() => sentTexts().length >= 1, 2_000, "first approval")
     await bridge.handleEvent({
       type: "permission.asked",
       data: { id: "per_b", sessionID: "ses_test1", action: "edit", resources: ["src/app.ts"] },
     })
-    await new Promise((resolve) => setTimeout(resolve, 60))
+    await waitFor(() => sentTexts().length >= 2, 2_000, "second approval")
 
     // Numbering must agree with what `/allow <n>` resolves — announcing the new
     // request as "1/1" used to make a bare "1" apply to the *older* one.
@@ -1798,5 +1828,153 @@ describe("hardening (audit follow-up)", () => {
     ilink.refuseSends = true
     await expect(bridge.sendToLast("发不出去")).resolves.toBe(false)
     ilink.refuseSends = false
+  })
+
+  test("a refused send retries without the context token and lands", async () => {
+    const { bridge } = await harness()
+    await bridge.handleInbound(inbound("/new 我的会话"))
+    clearSent()
+
+    // The stored reply window has expired: sending with the token is refused,
+    // the fallback without it succeeds. This is the self-healing path for a
+    // window that closed while the agent was still thinking.
+    ilink.refuseContextTokens = true
+    try {
+      await bridge.handleEvent({
+        type: "session.text.ended",
+        data: { sessionID: "ses_test1", assistantMessageID: "msg_1", ordinal: 0, text: "窗口过期也能发" },
+      })
+      await bridge.handleEvent({ type: "session.idle", data: { sessionID: "ses_test1" } })
+      await waitFor(() => sentTexts().length > 0, 2_000, "fallback delivery")
+      expect(sentTexts()).toEqual(["窗口过期也能发"])
+
+      const sends = ilink.attempts.filter((entry) => entry.path === "POST /ilink/bot/sendmessage")
+      expect(sends.length).toBeGreaterThanOrEqual(2)
+      expect((sends[0]!.body.msg as { context_token?: string }).context_token).toBeDefined()
+      expect((sends[1]!.body.msg as { context_token?: string }).context_token).toBeUndefined()
+    } finally {
+      ilink.refuseContextTokens = false
+    }
+  })
+
+  test("/cancel all leaves nothing of a stuck queue behind", async () => {
+    const { bridge } = await harness()
+    await bridge.handleInbound(inbound("/new 我的会话"))
+    ilink.refuseSends = true
+    await bridge.handleEvent({
+      type: "session.text.ended",
+      data: { sessionID: "ses_test1", assistantMessageID: "msg_1", ordinal: 0, text: "卡住的内容" },
+    })
+    await bridge.handleEvent({ type: "session.idle", data: { sessionID: "ses_test1" } })
+
+    // The window is still shut, so the stuck text survives the inbound flush and
+    // `/cancel all` is what removes it.
+    await bridge.handleInbound(inbound("/cancel all"))
+    const queued = readState().pendingOutbound?.[CONVERSATION] ?? []
+    expect(queued).not.toContain("卡住的内容")
+    // Both the stuck text and the ⚠️ notice that was queued in front of it.
+    expect(queued.join("\n")).toContain("丢弃了 2 条")
+    ilink.refuseSends = false
+  })
+
+  test("/always and /deny all reach every pending request", async () => {
+    const { bridge, calls } = await harness()
+    await bridge.handleInbound(inbound("/new 我的会话"))
+    await bridge.handleEvent({
+      type: "permission.asked",
+      data: { id: "per_1", sessionID: "ses_test1", action: "bash", resources: ["rm -rf build"] },
+    })
+    await bridge.handleEvent({
+      type: "permission.asked",
+      data: { id: "per_2", sessionID: "ses_test1", action: "edit", resources: ["src/app.ts"] },
+    })
+    await waitFor(() => sentTexts().length >= 1, 2_000, "approval announcement")
+
+    await bridge.handleInbound(inbound("/always 2"))
+    expect(calls.permissionReplies.at(-1)).toMatchObject({ requestID: "per_2", decision: "always" })
+
+    await bridge.handleInbound(inbound("/deny all"))
+    expect(calls.permissionReplies.at(-1)).toMatchObject({ requestID: "per_1", decision: "reject" })
+    expect(calls.permissionReplies).toHaveLength(2)
+  })
+
+  test("an approval answered elsewhere stops swallowing a bare digit", async () => {
+    const { bridge, calls } = await harness()
+    await bridge.handleInbound(inbound("/new 我的会话"))
+    await bridge.handleEvent({
+      type: "permission.asked",
+      data: { id: "per_1", sessionID: "ses_test1", action: "bash", resources: ["rm -rf build"] },
+    })
+    await waitFor(() => sentTexts().length >= 1, 2_000, "approval announcement")
+
+    // Answered on the desktop: the phone's next "1" is just a message again.
+    await bridge.handleEvent({ type: "permission.replied", data: { requestID: "per_1" } })
+    clearSent()
+    await bridge.handleInbound(inbound("1"))
+    expect(calls.permissionReplies).toHaveLength(0)
+    expect(calls.prompts.at(-1)?.text).toBe("1")
+  })
+
+  test("a form answered elsewhere stops being pending", async () => {
+    const { bridge } = await harness()
+    await bridge.handleInbound(inbound("/new 我的会话"))
+    await bridge.handleEvent({
+      type: "form.created",
+      data: {
+        form: {
+          id: "frm_gone",
+          sessionID: "ses_test1",
+          title: "选一个",
+          fields: [{ key: "k", title: "问题", type: "string" }],
+        },
+      },
+    })
+    await waitFor(() => sentTexts().length >= 1, 2_000, "form prompt")
+
+    await bridge.handleEvent({ type: "form.replied", data: { id: "frm_gone" } })
+    clearSent()
+    await bridge.handleInbound(inbound("/answer 随便"))
+    expect(sentTexts().join("\n")).toContain("没有待回答")
+  })
+
+  test("a multiselect submits an array, and an external field is refused", async () => {
+    const { bridge } = await harness()
+    await bridge.handleInbound(inbound("/new 我的会话"))
+
+    const created = (id: string, fields: unknown[]) =>
+      bridge.handleEvent({ type: "form.created", data: { form: { id, sessionID: "ses_test1", title: "多选", fields } } })
+
+    await created("frm_multi", [
+      {
+        key: "tags",
+        title: "标签",
+        type: "multiselect",
+        options: [
+          { value: "a", label: "甲" },
+          { value: "b", label: "乙" },
+        ],
+      },
+      { key: "note", title: "备注", type: "string" },
+    ])
+    await waitFor(() => sentTexts().length >= 1, 2_000, "form prompt")
+    clearSent()
+    await bridge.handleInbound(inbound("/answer 1=1,2；2=记一下"))
+    expect(apiMock.answered.at(-1)?.answer).toEqual({ tags: ["a", "b"], note: "记一下" })
+    expect(sentTexts().join("\n")).toContain("已提交")
+
+    // An external field can only be answered on the desktop; saying so beats
+    // submitting a wrong value.
+    await created("frm_ext", [{ key: "ext", title: "外部", type: "external" }])
+    await waitFor(() => sentTexts().some((text) => text.includes("想问你")), 2_000, "external prompt")
+    clearSent()
+    await bridge.handleInbound(inbound("/answer 随便"))
+    expect(sentTexts().join("\n")).toContain("桌面端处理")
+  })
+
+  test("sending a missing file explains itself", async () => {
+    const { bridge } = await harness()
+    await bridge.handleInbound(inbound("/new 我的会话"))
+    const result = await bridge.sendFileToLast({ filePath: join(tmpdir(), "wechat-definitely-missing.bin") })
+    expect(result).toContain("文件不存在")
   })
 })

@@ -316,8 +316,16 @@ export class Bridge {
       // silent — messages simply stop arriving, with no error to react to. If
       // the monitor has shown no activity for a while, rebuild it.
       // Publish poller liveness into the lock so another instance can tell a
-      // working owner from a wedged one.
-      if (this.#monitor) this.#lock?.touchPolledAt(this.#monitor.lastActivityAt)
+      // working owner from a wedged one, and so `verify.ts` can tell a healthy
+      // network from one that is silently dropping traffic: `polledAt` moves on
+      // every loop turn (timeouts included), `answeredAt` only on real answers.
+      if (this.#monitor) {
+        this.#lock?.touchPolledAt({
+          polledAt: this.#monitor.lastActivityAt,
+          answeredAt: this.#monitor.lastResponseAt,
+          timeouts: this.#monitor.consecutiveTimeouts,
+        })
+      }
       if (this.#monitor && Date.now() - this.#monitor.lastActivityAt > POLL_STALL_MS) {
         this.#log.warn(
           `poller looks stuck (no activity for ${Math.round((Date.now() - this.#monitor.lastActivityAt) / 1000)}s); restarting it`,
@@ -547,8 +555,13 @@ export class Bridge {
       const text = live && live.sent > 0 ? live.pending.trim() : (turn?.parts ?? []).join("\n\n").trim()
       const conversationId = turn?.conversationId ?? live?.conversationId
       if (!text || !conversationId) continue
-      this.#enqueue(conversationId, [renderForWechat(text)])
-      this.#log.info(`preserved an unfinished turn (${text.length} chars) before stopping`)
+      // Queue items are flushed without re-chunking and `sendText` refuses
+      // anything over the service limit, so a long turn must be cut here — as a
+      // single oversized item every retry would fail locally and the answer
+      // would never arrive at all.
+      const chunked = chunkText(renderForWechat(text), Math.max(64, this.#config.chunkSize - 12))
+      this.#enqueue(conversationId, numberChunks(chunked))
+      this.#log.info(`preserved an unfinished turn (${text.length} chars, ${chunked.length} part(s)) before stopping`)
     }
   }
 
@@ -560,8 +573,7 @@ export class Bridge {
    * cost the user another QR scan for a channel that was already fixed.
    */
   #handleStaleToken(rejectedToken?: string): void {
-    const current = this.#state.account?.token
-    if (rejectedToken !== undefined && current !== rejectedToken) {
+    if (!shouldClearStaleToken(this.#state.account?.token, rejectedToken)) {
       this.#log.info("a stale-token report arrived for an old credential; keeping the current one")
       return
     }
@@ -579,6 +591,7 @@ export class Bridge {
 
   async handleInbound(message: InboundMessage): Promise<void> {
     const conversationId = conversationIdOf(message)
+    this.#sweepStaleQuestions()
 
     // Duplicate suppression first: a duplicate costs a real model call, and
     // "same message twice" is indistinguishable from the user repeating
@@ -662,6 +675,27 @@ export class Bridge {
     await this.#dispatch(conversationId, text, attachments, titleHint)
   }
 
+  /** Drop question records whose asker is gone (reload/crash) or that expired. */
+  #sweepStaleQuestions(): void {
+    const now = Date.now()
+    const ttl = 60 * 60_000
+    const pending = Object.entries(this.#state.pendingQuestions ?? {}).filter(
+      ([, entry]) => entry.expiresAt + ttl < now,
+    )
+    const answers = Object.entries(this.#state.questionAnswers ?? {}).filter(
+      ([, entry]) => entry.answeredAt + ttl < now,
+    )
+    if (pending.length === 0 && answers.length === 0) return
+    this.#state = updateState((state) => {
+      const nextPending = { ...(state.pendingQuestions ?? {}) }
+      const nextAnswers = { ...(state.questionAnswers ?? {}) }
+      for (const [key] of pending) delete nextPending[key]
+      for (const [key] of answers) delete nextAnswers[key]
+      state.pendingQuestions = nextPending
+      state.questionAnswers = nextAnswers
+    })
+  }
+
   /** Placeholder title for a message that carries no text at all. */
   #placeholderForMessage(message: InboundMessage): string | undefined {
     const kinds = new Set((message.media ?? []).map((item) => item.type))
@@ -707,8 +741,11 @@ export class Bridge {
       ].join("\n"),
     )
     if (!delivered) {
-      this.#clearQuestion(conversationId, askedAt)
-      return "微信消息没有发出去（通道未登录，或回复窗口关闭后正在重试）。请改用普通回复说明情况。"
+      // "Not delivered" usually means the question was *queued* (the window is
+      // shut) and will arrive with the next inbound — so keep it registered and
+      // keep waiting, or the eventual reply would be dispatched as a stray
+      // prompt instead of answering this call.
+      this.#log.warn("question queued: the reply window is closed; still waiting for an answer")
     }
 
     return await this.#awaitAnswer(conversationId, askedAt, timeoutMs)
@@ -726,8 +763,14 @@ export class Bridge {
       const deadline = askedAt + timeoutMs
       const finish = (text: string): void => {
         clearInterval(timer)
-        this.#clearQuestion(conversationId, askedAt)
+        // Answer first: clearing is bookkeeping, and a state write that fails
+        // must not swallow the answer this call is waiting for.
         resolve(text)
+        try {
+          this.#clearQuestion(conversationId, askedAt)
+        } catch (error) {
+          this.#log.warn(`clearing the question failed: ${errorText(error)}`)
+        }
       }
       const timer = setInterval(() => {
         const answer = readState().questionAnswers?.[conversationId]
@@ -769,11 +812,19 @@ export class Bridge {
   #isAllowed(peerId: string): boolean {
     const allowed = this.#config.allowedUsers
     if (allowed.length === 0) {
-      const bound = this.#state.account?.userId
-      // Not logged in: nobody is bound, so nobody may drive the bot. This used
-      // to allow everyone whenever the account was missing.
-      if (!bound) return false
-      return bound === peerId
+      const account = this.#state.account
+      // Logged out: nobody may drive the bot.
+      if (!account?.token) return false
+      if (!account.userId) {
+        // The server can omit the bound user id (and older state files lack it).
+        // Adopt the first sender instead of going deaf on every message.
+        this.#state = updateState((state) => {
+          if (state.account) state.account = { ...state.account, userId: peerId }
+        })
+        this.#log.warn(`账户没有记录绑定微信 id，已采用第一个发送者：${peerId}`)
+        return true
+      }
+      return account.userId === peerId
     }
     if (allowed.includes(peerId)) return true
     return this.#state.account?.userId === peerId && allowed.includes("self")
@@ -1670,9 +1721,15 @@ export class Bridge {
       // leaving "typing…" on the phone indefinitely.
       await this.#setTyping(conversationId, false)
       this.#typingSessions.delete(binding.sessionID)
+      // Drop both buffers: the live buffer is the only record that a prefix was
+      // already streamed, so leaving the turn behind would resend the whole
+      // answer when the grace timer fires.
       const live = this.#live.get(binding.sessionID)
       if (live?.timer) clearInterval(live.timer)
       this.#live.delete(binding.sessionID)
+      const turn = this.#turns.get(binding.sessionID)
+      if (turn?.timer) clearTimeout(turn.timer)
+      this.#turns.delete(binding.sessionID)
       const dropped = argument === "all" ? this.#dropQueue(conversationId) : 0
       await this.#send(
         conversationId,
@@ -2707,11 +2764,13 @@ export class Bridge {
       return
     }
 
-    this.#flushing.add(conversationId)
     const generation = this.#queueGenerations.get(conversationId) ?? 0
-    this.#setQueue(conversationId, [])
     let delivered = 0
     try {
+      // Inside the try: a throwing state write here used to leave `#flushing`
+      // set forever, stalling this conversation's queue until a restart.
+      this.#flushing.add(conversationId)
+      this.#setQueue(conversationId, [])
       for (const item of batch) {
         const refused = await this.#chain(conversationId, () => this.#trySend(conversationId, item))
         if (refused) {
@@ -2738,7 +2797,13 @@ export class Bridge {
     if ((this.#queueGenerations.get(conversationId) ?? 0) !== generation) return
 
     const appended = this.#queueFor(conversationId)
-    this.#setQueue(conversationId, [...remaining, ...appended].slice(-QUEUE_LIMIT))
+    const merged = [...remaining, ...appended]
+    if (merged.length > QUEUE_LIMIT) {
+      // Never silent: the dropped items are the oldest, which may be the very
+      // tail this flush was trying to deliver.
+      this.#log.warn(`queue over ${QUEUE_LIMIT} after a flush: dropping ${merged.length - QUEUE_LIMIT} oldest item(s)`)
+    }
+    this.#setQueue(conversationId, merged.slice(-QUEUE_LIMIT))
     this.#scheduleRetry(conversationId)
   }
 
@@ -2868,7 +2933,10 @@ export function chunkText(text: string, limit: number): string[] {
     let rest = piece
     // A chunk that ends inside a fence gets "```\n" appended by `flush`, so that
     // space belongs to the budget or the chunk overshoots the limit.
-    const closer = (): number => (fence ? 4 : 0)
+    // Always reserve room for a closing fence: whether one is appended depends
+    // on the fence state at flush time, which can differ from the state when
+    // the text was appended.
+    const closer = (): number => 4
     while (rest.length > 0) {
       const head = current === "" ? "" : "\n"
       const room = budget - current.length - head.length - closer()
@@ -2927,4 +2995,16 @@ export function errorText(error: unknown): string {
 /** True when a maintenance tick arrived so late that the process was suspended. */
 export function isResumeGap(previousTick: number, now: number): boolean {
   return previousTick > 0 && now - previousTick > SUSPENSION_GAP_MS
+}
+
+/**
+ * Whether a stale-token report may clear the stored credential.
+ *
+ * A re-login can land between the server's rejection and this handler, and
+ * wiping the fresh token would cost the user another QR scan for a channel that
+ * was already fixed — so only the credential the poller actually used may go.
+ */
+export function shouldClearStaleToken(current: string | undefined, rejectedToken: string | undefined): boolean {
+  if (rejectedToken === undefined) return true
+  return current === rejectedToken
 }

@@ -278,6 +278,10 @@ export function conversationKey(accountId: string, peerId: string, groupId?: str
  */
 export function toInbound(account: WeixinAccount, raw: WeixinMessage): InboundMessage | undefined {
   if (raw.message_type === MessageType.BOT) return undefined
+  // Direct messages only: the ClawBot protocol declares no group support, and
+  // answering into a group would bind a group conversation the bridge does not
+  // model (the README promises groups are ignored, so this enforces it).
+  if (raw.group_id) return undefined
   const peerId = raw.from_user_id?.trim()
   if (!peerId) return undefined
 

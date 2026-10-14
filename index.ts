@@ -20,6 +20,73 @@ import { login } from "./ilink.ts"
 
 type Ctx = Parameters<Parameters<typeof Plugin.define>[0]["setup"]>[0]
 
+/** The shape every logger here shares. */
+interface LoggerLike {
+  info: (message: string) => void
+  warn: (message: string) => void
+}
+
+/** Everything the ownership loop needs to do its job. */
+export interface OwnershipLoop {
+  /** Run one ownership check by hand (the timer calls it too). */
+  tick: () => void
+  /** Stop the timer and the event subscription. */
+  dispose: () => void
+}
+
+/**
+ * The once-per-interval ownership check.
+ *
+ * Extracted from `setup` so tests can drive it directly. This loop is where a
+ * plugin instance claims the poller slot, keeps the event subscription alive
+ * (a stream that ended is resubscribed on the next tick), and picks up config
+ * edits written by the desktop commands.
+ */
+export function createOwnershipLoop(params: {
+  ctx: Ctx
+  bridge: Bridge
+  log: LoggerLike
+  intervalMs?: number
+}): OwnershipLoop {
+  const { ctx, bridge, log } = params
+  let stopEvents: (() => void) | undefined
+  let disposed = false
+
+  const tick = (): void => {
+    if (disposed) return
+    try {
+      bridge.reloadState()
+      bridge.setConfig(readConfig())
+      const owned = bridge.tryBecomeOwner()
+      if (owned && !stopEvents) {
+        stopEvents = subscribeToEvents(ctx, bridge, log, () => {
+          // Resubscribe on the next tick (10s): an ended stream used to leave
+          // the channel "connected" with no events at all.
+          stopEvents = undefined
+        })
+      } else if (!owned && stopEvents) {
+        stopEvents()
+        stopEvents = undefined
+      }
+    } catch (error) {
+      log.warn(`ownership tick failed: ${errorText(error)}`)
+    }
+  }
+
+  const timer = setInterval(tick, params.intervalMs ?? TAKEOVER_INTERVAL_MS)
+  timer.unref?.()
+
+  return {
+    tick,
+    dispose: () => {
+      disposed = true
+      clearInterval(timer)
+      stopEvents?.()
+      stopEvents = undefined
+    },
+  }
+}
+
 const LOG_PATH = join(STATE_DIR, "bridge.log")
 const LOG_MAX_BYTES = 512 * 1024
 /**
@@ -75,46 +142,15 @@ export default Plugin.define({
       }`,
     )
 
-    let stopEvents: (() => void) | undefined
-
-    /**
-     * One timer does everything ownership needs: refresh the state file (a login
-     * may have landed since the last tick), pick up config edits, try to claim
-     * or keep the poller slot, and keep the event subscription in sync with
-     * ownership. Several instances share a process, so "am I the owner?" must be
-     * re-checked rather than remembered.
-     */
-    const tick = (): void => {
-      try {
-        bridge.reloadState()
-        bridge.setConfig(readConfig())
-        const owned = bridge.tryBecomeOwner()
-        if (owned && !stopEvents) {
-          stopEvents = subscribeToEvents(ctx, bridge, log, () => {
-            // Resubscribe on the next tick (10s): an ended stream used to leave
-            // the channel "connected" with no events at all.
-            stopEvents = undefined
-          })
-        } else if (!owned && stopEvents) {
-          stopEvents()
-          stopEvents = undefined
-        }
-      } catch (error) {
-        log.warn(`ownership tick failed: ${errorText(error)}`)
-      }
-    }
-
-    tick()
+    const loop = createOwnershipLoop({ ctx, bridge, log })
+    loop.tick()
     if (!bridge.ownsPoller) log.info("another instance already polls WeChat; standing by")
-    const ownershipTimer = setInterval(tick, TAKEOVER_INTERVAL_MS)
-    ownershipTimer.unref?.()
 
     await registerTools(ctx, bridge, log).catch((error) => log.warn(`tool registration failed: ${errorText(error)}`))
     await registerCommands(ctx, bridge, log).catch((error) => log.warn(`command registration failed: ${errorText(error)}`))
 
     return () => {
-      stopEvents?.()
-      clearInterval(ownershipTimer)
+      loop.dispose()
       void bridge.announceStop()
       bridge.releaseOwnership()
       log.info("plugin unloaded")

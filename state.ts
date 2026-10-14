@@ -150,8 +150,18 @@ export function readState(): State {
       }
       return normalizeState({})
     }
-    // A transient IO failure: prefer what we already know over emptiness, and
-    // refuse to invent a state when there is nothing to fall back on.
+    // One immediate retry: most failures here are a rename race with another
+    // instance, which clears within microseconds.
+    try {
+      const retry = JSON.parse(readFileSync(STATE_PATH, "utf8")) as Partial<State>
+      const state = normalizeState(retry)
+      lastGoodState = state
+      return state
+    } catch {
+      // Fall through.
+    }
+    // Still failing: prefer what we already know over emptiness, and refuse to
+    // invent a state when there is nothing to fall back on.
     if (lastGoodState) return lastGoodState
     throw error
   }
@@ -244,17 +254,21 @@ export interface LockInfo {
    *
    * A healthy poller advances this at least once per server timeout (~40s), so
    * a stale value means the owner is wedged and the slot must be stealable.
-   * Without it, a stuck owner keeps a fresh heartbeat and every other instance
-   * stands by forever — which is exactly how the channel silently went deaf.
+   * Note that a *client* timeout also advances it (the loop turned over); the
+   * field that only moves on a real answer is `answeredAt`.
    */
   polledAt?: number
+  /** Last poll the server actually answered, for diagnosing a dead network. */
+  answeredAt?: number
+  /** Consecutive polls that ended by client timeout. */
+  timeouts?: number
 }
 
 export interface LockHandle {
   info: LockInfo
   refresh: () => void
   /** Record poller liveness so a wedged owner can be detected from outside. */
-  touchPolledAt: (at: number) => void
+  touchPolledAt: (info: { polledAt?: number; answeredAt?: number; timeouts?: number }) => void
   release: () => void
 }
 
@@ -342,10 +356,12 @@ export function acquireLock(location: string): LockHandle | undefined {
     }
   }
 
-  const touchPolledAt = (at: number): void => {
+  const touchPolledAt = (info2: { polledAt?: number; answeredAt?: number; timeouts?: number }): void => {
     try {
       if (!stillOurs()) return
-      info.polledAt = at
+      if (info2.polledAt !== undefined) info.polledAt = info2.polledAt
+      if (info2.answeredAt !== undefined) info.answeredAt = info2.answeredAt
+      if (info2.timeouts !== undefined) info.timeouts = info2.timeouts
       writePrivate(LOCK_PATH, JSON.stringify(info))
     } catch {
       // Best effort: the watchdog on the owner side covers a missed write.

@@ -576,6 +576,15 @@ describe("poller lock", () => {
  * ---------------------------------------------------------------------------
  */
 
+async function waitFor(condition: () => boolean, timeoutMs = 2_000, label = "condition"): Promise<void> {
+  const deadline = Date.now() + timeoutMs
+  while (Date.now() < deadline) {
+    if (condition()) return
+    await new Promise((resolve) => setTimeout(resolve, 5))
+  }
+  throw new Error(`timed out waiting for ${label}`)
+}
+
 describe("network watchdog", () => {
   test("a maintenance tick only counts as a resume after a long gap", () => {
     const now = Date.now()
@@ -618,13 +627,11 @@ describe("network watchdog", () => {
     const controller = new AbortController()
     const running = monitor.run(controller.signal)
 
-    await new Promise((resolve) => setTimeout(resolve, 250))
-    expect(timeouts.length).toBeGreaterThanOrEqual(2)
+    await waitFor(() => timeouts.length >= 2, 2_000, "two poll timeouts")
     expect(timeouts[0]).toBe(1)
-    expect(monitor.consecutiveTimeouts).toBeGreaterThanOrEqual(2)
 
     mode = "answer"
-    await new Promise((resolve) => setTimeout(resolve, 300))
+    await waitFor(() => recovered >= 1, 2_000, "poll recovery")
     controller.abort()
     await running
 

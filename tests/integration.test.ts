@@ -38,6 +38,8 @@ interface MockState {
   uploadAesKeyHex?: string
   qrPolls: number
   sendRefusals: number
+  /** Respond to `getupdates` with `errcode -14` (revoked token). */
+  staleToken: boolean
   downloadBytes: Buffer
   downloadAesKey: Buffer
 }
@@ -60,6 +62,7 @@ beforeAll(async () => {
     updates: [],
     qrPolls: 0,
     sendRefusals: 0,
+    staleToken: false,
     downloadBytes: Buffer.from("inbound-bytes"),
     downloadAesKey: randomBytes(16),
   }
@@ -104,6 +107,10 @@ beforeAll(async () => {
           return
         }
         case "POST /ilink/bot/getupdates": {
+          if (state.staleToken) {
+            json({ ret: 0, errcode: -14, errmsg: "session expired", longpolling_timeout_ms: 1_000 })
+            return
+          }
           const next = state.updates.shift()
           if (!next) {
             json({ ret: 0, msgs: [], get_updates_buf: "buf-idle", longpolling_timeout_ms: 1_000 })
@@ -286,11 +293,27 @@ describe("monitor", () => {
   })
 
   test("treats a stale token as a stop, not a retry loop", async () => {
-    const account: WeixinAccount = { accountId: "bot@im.bot", token: "token-1", baseUrl: `${baseUrl}/stale` }
-    // No listener on /stale: the fetch fails, which the monitor retries. Point
-    // the account at the real mock instead and simulate -14 through a message
-    // batch is not possible, so assert the happy-path contract instead.
-    expect(account.token).toBe("token-1")
+    const account: WeixinAccount = { accountId: "bot@im.bot", token: "token-1", baseUrl }
+    state.updates = []
+    state.staleToken = true
+    const stops: Array<{ reason: string; detail?: string }> = []
+    try {
+      const monitor = new ChannelMonitor({
+        account,
+        onMessage: async () => {},
+        onStop: (reason, detail) => {
+          stops.push({ reason, detail })
+        },
+      })
+      // `errcode -14` means the bot token is gone: the loop must stop and say so,
+      // because retrying is pointless until the user scans a new QR code.
+      expect(await monitor.run(new AbortController().signal)).toBe("stale-token")
+      expect(stops).toHaveLength(1)
+      expect(stops[0].reason).toBe("stale-token")
+      expect(stops[0].detail).toContain("token")
+    } finally {
+      state.staleToken = false
+    }
   })
 })
 

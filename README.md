@@ -34,7 +34,7 @@ opencode **主动向外长轮询**腾讯 iLink 网关，所以电脑开着、ope
 | 🔁 **半截回答也能收全** | 多段回答自带编号 `（1/3）…`，被限流时入队并自动补发；`/more`（`/继续`）区分两种情况：**有卡住的就补发（不叫模型），确实没写完才让模型接着写** |
 | 🔁 **重复消息不花钱** | `message_id` 去重（最近 200 条），重复投递直接忽略，不会重复调用模型 |
 | 📚 **手机上就能查手册** | `/help` 总览、`/help 命令` 单条、`/help 全部` 全文；`MANUAL.md` 与代码同源自动生成；`/list` 支持翻页 |
-| 🧪 **有测试套件** | 160 个自动化测试（单元 + mock iLink 协议 + 假 ctx 行为测试）+ strict 类型检查（含 `noUnusedLocals`），真机验证记录见文末 |
+| 🧪 **有测试套件** | 174 个自动化测试（单元 + mock iLink 协议 + 假 ctx 行为测试）+ strict 类型检查（含 `noUnusedLocals`），真机验证记录见文末 |
 
 
 ## 最快上手
@@ -307,7 +307,7 @@ bun $env:USERPROFILE\.config\opencode\plugins\wechat\verify.ts
 
 ```powershell
 cd $env:USERPROFILE\.config\opencode\plugins\wechat
-bun test          # 160 个测试：单元 + mock iLink + 假 ctx 驱动的 Bridge 行为
+bun test          # 174 个测试：单元 + mock iLink + 假 ctx 驱动的 Bridge 行为
 bun run typecheck # 用官方 @opencode/plugin 类型做 strict 检查
 bun verify.ts     # 环境自检
 bun gen-manual.ts # 改了 manual.ts 之后重新生成 MANUAL.md
