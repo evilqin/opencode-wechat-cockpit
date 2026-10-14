@@ -11,7 +11,7 @@
  * logged. They are deliberately outside any repository.
  */
 
-import { existsSync, mkdirSync, readFileSync, renameSync, rmSync, writeFileSync } from "node:fs"
+import { existsSync, mkdirSync, readdirSync, readFileSync, renameSync, rmSync, statSync, writeFileSync } from "node:fs"
 import { homedir } from "node:os"
 import { join } from "node:path"
 import { randomUUID } from "node:crypto"
@@ -169,7 +169,48 @@ export function writePrivate(path: string, content: string): void {
   // PID-based name would let two writers clobber each other's temp file.
   const tmp = `${path}.${process.pid}.${randomUUID()}.tmp`
   writeFileSync(tmp, content, { mode: 0o600 })
-  renameSync(tmp, path)
+  try {
+    renameSync(tmp, path)
+  } catch (error) {
+    // A failed rename (a Windows sharing violation while another instance reads
+    // the file, or a killed process) must not leave the temp file behind for
+    // years — that is how eight of them piled up in the state directory.
+    try {
+      rmSync(tmp, { force: true })
+    } catch {
+      // Best effort.
+    }
+    throw error
+  }
+}
+
+/** How long a `*.tmp` file may sit around before it is considered abandoned. */
+const TEMP_FILE_TTL_MS = 5 * 60_000
+
+/**
+ * Delete abandoned temp files from the state directory.
+ *
+ * Called once per plugin load: a process that died between the write and the
+ * rename otherwise leaves its temp file in a directory nobody ever cleans.
+ */
+export function pruneStaleTemps(now: number = Date.now()): number {
+  let removed = 0
+  try {
+    for (const name of readdirSync(STATE_DIR)) {
+      if (!name.endsWith(".tmp")) continue
+      const path = join(STATE_DIR, name)
+      try {
+        if (now - statSync(path).mtimeMs < TEMP_FILE_TTL_MS) continue
+        rmSync(path, { force: true })
+        removed += 1
+      } catch {
+        // A racing cleanup is fine.
+      }
+    }
+  } catch {
+    // No state directory yet.
+  }
+  return removed
 }
 
 /** Small helper for read-modify-write sequences inside the bridge. */
@@ -236,6 +277,7 @@ export const LOCK_POLL_STALE_MS = 120_000
  */
 export function acquireLock(location: string): LockHandle | undefined {
   ensureStateDir()
+  pruneStaleTemps()
   const now = Date.now()
 
   const info: LockInfo = {

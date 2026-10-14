@@ -35,7 +35,7 @@ import {
   SendRefusedError,
 } from "../ilink.ts"
 import { MAX_DOWNLOAD_BYTES, fetchMedia, pruneInbox } from "../media.ts"
-import { LOCK_PATH, STATE_DIR, STATE_PATH, acquireLock, ensureStateDir, readState } from "../state.ts"
+import { LOCK_PATH, STATE_DIR, STATE_PATH, acquireLock, ensureStateDir, pruneStaleTemps, readState } from "../state.ts"
 import { randomBytes } from "node:crypto"
 import { existsSync, mkdirSync, rmSync, utimesSync, writeFileSync } from "node:fs"
 import { join } from "node:path"
@@ -506,6 +506,20 @@ describe("media hardening", () => {
     expect(readState().bindings).toEqual({})
     expect(existsSync(`${STATE_PATH}.corrupt`)).toBe(true)
     rmSync(`${STATE_PATH}.corrupt`, { force: true })
+  })
+  test("abandoned temp files are cleaned from the state directory", () => {
+    ensureStateDir()
+    const stale = join(STATE_DIR, "lock.json.999.abc.tmp")
+    const fresh = join(STATE_DIR, "lock.json.999.def.tmp")
+    writeFileSync(stale, "{}")
+    writeFileSync(fresh, "{}")
+    const longAgo = (Date.now() - 60 * 60 * 1000) / 1000
+    utimesSync(stale, longAgo, longAgo)
+
+    expect(pruneStaleTemps()).toBeGreaterThanOrEqual(1)
+    expect(existsSync(stale)).toBe(false)
+    expect(existsSync(fresh)).toBe(true)
+    rmSync(fresh, { force: true })
   })
 })
 
