@@ -40,6 +40,8 @@ interface MockState {
   sendRefusals: number
   /** Respond to `getupdates` with `errcode -14` (revoked token). */
   staleToken: boolean
+  /** Answer `getupdates` with a captive-portal HTML page. */
+  portal: boolean
   downloadBytes: Buffer
   downloadAesKey: Buffer
 }
@@ -63,6 +65,7 @@ beforeAll(async () => {
     qrPolls: 0,
     sendRefusals: 0,
     staleToken: false,
+    portal: false,
     downloadBytes: Buffer.from("inbound-bytes"),
     downloadAesKey: randomBytes(16),
   }
@@ -87,6 +90,16 @@ beforeAll(async () => {
         response.writeHead(200, { "content-type": "application/json", ...headers })
         response.end(JSON.stringify(payload))
       }
+      /** JSON with the content-type the real long-poll gateway uses. */
+      const wireJson = (payload: unknown): void => {
+        response.writeHead(200, { "content-type": "application/octet-stream" })
+        response.end(JSON.stringify(payload))
+      }
+      /** A captive portal: 200 + HTML, which must be diagnosed, not parsed. */
+      const portal = (): void => {
+        response.writeHead(200, { "content-type": "text/html" })
+        response.end("<!DOCTYPE html><html><body>请先完成校园网认证</body></html>")
+      }
 
       switch (`${request.method} ${url.pathname}`) {
         case "POST /ilink/bot/get_bot_qrcode":
@@ -107,16 +120,24 @@ beforeAll(async () => {
           return
         }
         case "POST /ilink/bot/getupdates": {
+          if (state.portal) {
+            portal()
+            return
+          }
           if (state.staleToken) {
             json({ ret: 0, errcode: -14, errmsg: "session expired", longpolling_timeout_ms: 1_000 })
             return
           }
           const next = state.updates.shift()
+          // The real gateway answers the long poll with `content-type:
+          // application/octet-stream` even though the body is JSON. The mock
+          // must do the same, or a content-type check that rejects the real
+          // server sails through CI (it did exactly that once).
           if (!next) {
-            json({ ret: 0, msgs: [], get_updates_buf: "buf-idle", longpolling_timeout_ms: 1_000 })
+            wireJson({ ret: 0, msgs: [], get_updates_buf: "buf-idle", longpolling_timeout_ms: 1_000 })
             return
           }
-          json({ ret: 0, msgs: next.msgs, get_updates_buf: next.buf, longpolling_timeout_ms: 1_000 })
+          wireJson({ ret: 0, msgs: next.msgs, get_updates_buf: next.buf, longpolling_timeout_ms: 1_000 })
           return
         }
         case "POST /ilink/bot/sendmessage": {
@@ -692,6 +713,30 @@ describe("protocol hardening", () => {
     expect(await monitor.run(controller.signal)).toBe("aborted")
     expect(cursors).toEqual(["cursor-batch", "cursor-start"])
     expect(received).toEqual(["第一条", "第二条"])
+  })
+
+  test("a captive-portal page is diagnosed, and the gateway's octet-stream JSON is accepted", async () => {
+    const account: WeixinAccount = { accountId: "bot@im.bot", token: "token-1", baseUrl, userId: "user@im.wechat" }
+    // Every other test in this file already exercises the octet-stream JSON
+    // (the mock answers the long poll the way the real gateway does); this one
+    // pins the *portal* case.
+    state.portal = true
+    const errors: string[] = []
+    const controller = new AbortController()
+    try {
+      const monitor = new ChannelMonitor({
+        account,
+        onMessage: async () => undefined,
+        onError: (error) => {
+          errors.push(error instanceof Error ? error.message : String(error))
+          controller.abort()
+        },
+      })
+      expect(await monitor.run(controller.signal)).toBe("aborted")
+      expect(errors.some((message) => message.includes("门户"))).toBe(true)
+    } finally {
+      state.portal = false
+    }
   })
 
   test("a nonsense poll timeout suggestion is clamped", () => {

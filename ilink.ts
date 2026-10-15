@@ -389,14 +389,16 @@ export async function apiCallRaw(request: ApiRequest): Promise<string> {
     })
     const text = await readBoundedText(response, MAX_API_BODY_BYTES)
     if (!response.ok) throw new ApiHttpError(request.endpoint, response.status, text)
-    // A captive portal answers 200 with an HTML page. Say what happened instead
-    // of letting JSON.parse fail with "Unexpected token '<'" and masking the
-    // real cause behind a syntax error nobody can act on.
-    const type = (response.headers.get("content-type") ?? "").toLowerCase()
-    const looksJson = !type || type.includes("json") || type.includes("text/plain")
-    if (text.trim() && !looksJson) {
+    // A captive portal answers 200 with an HTML page. Only *that* is diagnosed
+    // here: the real iLink gateway answers valid JSON with
+    // `content-type: application/octet-stream`, so a content-type check alone
+    // would reject the actual server (which it did, once, until the probe in
+    // the logs showed the gateway's real header).
+    const trimmed = text.trimStart()
+    if (trimmed.startsWith("<")) {
+      const type = (response.headers.get("content-type") ?? "").toLowerCase()
       throw new Error(
-        `${request.endpoint} 返回的不是 JSON（content-type: ${type}）——校园网/酒店门户会这样，先完成认证再重试`,
+        `${request.endpoint} 返回的是网页而不是 JSON（content-type: ${type || "无"}）——校园网/酒店门户会这样，先完成认证再重试`,
       )
     }
     return text
