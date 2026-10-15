@@ -40,7 +40,7 @@ is built for "**you are away, the computer is working**":
 | 🔁 **Half an answer is still recoverable** | Multi-part replies are numbered `（1/3）…`; rate-limited parts are queued and re-sent automatically; `/more` (`/继续`) tells the two cases apart — **stuck text is re-sent without calling the model, only a genuinely unfinished answer asks it to continue** |
 | 🔁 **Duplicates cost nothing** | `message_id` dedup (last 200) so a redelivered message never triggers a second model call. |
 | 📚 **Manual on your phone** | `/help` for the overview, `/help attach` for one command, `/help 全部` for the full manual; `MANUAL.md` is generated from the same source as the bot's answers; `/list` supports paging. |
-| 🧪 **Tested** | 200 automated tests (unit + mock-iLink protocol + fake-context behaviour) with strict type checking (including `noUnusedLocals`). Real-device verification is at the bottom. |
+| 🧪 **Tested** | 202 automated tests (unit + mock-iLink protocol + fake-context behaviour) with strict type checking (including `noUnusedLocals`). Real-device verification is at the bottom. |
 
 ## Quickstart
 
@@ -246,11 +246,12 @@ retries with 5s → 15s → 45s → 2min → 5min backoff, and **flushes the que
 send anything**. Media (files/images) are stricter than text.
 
 **Replies, but not forever.** WeChat cannot edit messages, so text is assembled per turn and
-sent when the turn ends. The real end signal in v2 is `session.status` (`status.type: "idle"`)
-plus `session.execution.succeeded` (`session.idle` never arrived in practice); after it the reply
-waits only `turnSettleMs` (0.6 s) so a trailing text block can still merge. If no signal arrives
-at all, `turnGraceMs` (3 s) is the fallback. The log line `reply sent (trigger: idle|timer)` says
-which path delivered.
+sent when the turn ends. The reliable signals are `session.status` (`status.type: "idle"`) and
+`session.execution.succeeded`; after one of them the reply waits only `turnSettleMs` (0.6 s) so a
+trailing text block can still merge. A **step boundary** (`session.step.ended`) is used as an
+accelerator with the same short window — and is undone the moment a tool call or a new block
+shows the turn is still going, so multi-step answers are not split. If no signal arrives at all,
+`turnGraceMs` (3 s) is the fallback. `reply sent (trigger: idle|step|timer)` says which path ran.
 
 **Cursor before dispatch.** The long-poll cursor is written to disk before messages are
 handled: a crash replays, it does not drop.
@@ -287,7 +288,7 @@ Logs: `~/.config/opencode/wechat/bridge.log`; `/status` and `/log` work from WeC
 
 ```bash
 cd types && bun install  # one-time: the official types (types/ is gitignored)
-bun test          # 200 tests: unit + mock iLink + fake-context Bridge behaviour
+bun test          # 202 tests: unit + mock iLink + fake-context Bridge behaviour
 bun run typecheck # strict check against the official @opencode/plugin types
 bun verify.ts     # environment self-check
 bun gen-manual.ts # regenerate MANUAL.md after editing manual.ts

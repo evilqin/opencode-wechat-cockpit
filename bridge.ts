@@ -202,6 +202,8 @@ export class Bridge {
    * and a new turn (busy/started) clears the flag again.
    */
   #settledTurns = new Set<string>()
+  /** Sessions whose last step ended — a hint, undone by `#relaxTurn`. */
+  #steppedTurns = new Set<string>()
   /** Event types seen once, so a renamed host event is visible in the log. */
   #seenEventTypes = new Set<string>()
   #pendingPermissions: PendingPermission[] = []
@@ -485,6 +487,9 @@ export class Bridge {
     }
     for (const sessionID of [...this.#settledTurns]) {
       if (!live.has(sessionID)) this.#settledTurns.delete(sessionID)
+    }
+    for (const sessionID of [...this.#steppedTurns]) {
+      if (!live.has(sessionID)) this.#steppedTurns.delete(sessionID)
     }
     // Approval/form records belong to a session; a conversation that is gone
     // cannot answer them.
@@ -2533,6 +2538,8 @@ export class Bridge {
       }
 
       case "session.tool.called": {
+        // A tool call means the turn continues: undo a step-end hint.
+        if (sessionID) this.#relaxTurn(sessionID)
         if (this.#config.progress !== "tools" || !sessionID) return
         const conversationId = this.#conversationForSession(sessionID)
         if (!conversationId) return
@@ -2540,6 +2547,11 @@ export class Bridge {
         if (name.startsWith("wechat_")) return
         const summary = summarizeToolInput(data.input)
         await this.#sendEphemeral(conversationId, `🔧 ${name}${summary ? `: ${summary}` : ""}`)
+        return
+      }
+
+      case "session.step.started": {
+        if (sessionID) this.#relaxTurn(sessionID)
         return
       }
 
@@ -2561,14 +2573,25 @@ export class Bridge {
       case "session.execution.started": {
         // A new turn began: the settle shortcut belongs to the previous one.
         if (sessionID) this.#settledTurns.delete(sessionID)
+        if (sessionID) this.#relaxTurn(sessionID)
+        return
+      }
+
+      case "session.step.ended": {
+        // A *step* ended — often, but not always, the whole turn: a tool call
+        // starts another step. So this only shortens the pending wait to the
+        // settle window; any following tool/step/text event puts the full grace
+        // back (`#relaxTurn`). This is what takes ~2.5 s off most replies, and
+        // it fires on every turn where `session.idle`/`session.status` never do.
+        if (sessionID) this.#finishTurnSoon(sessionID, "step")
         return
       }
 
       case "session.idle":
       case "session.execution.succeeded": {
         // Both mean "the turn is over". `session.execution.succeeded` is the
-        // durable one and does arrive; `session.idle` is kept as a fallback.
-        if (sessionID) await this.#finishTurnSoon(sessionID)
+        // durable one; `session.idle` is kept as a fallback.
+        if (sessionID) await this.#finishTurnSoon(sessionID, "idle")
         return
       }
 
@@ -2577,7 +2600,7 @@ export class Bridge {
         const status = (data.status ?? {}) as { type?: string; attempt?: number; message?: string } | string
         const kind = typeof status === "string" ? status : status.type
         if (kind === "idle") {
-          await this.#finishTurnSoon(sessionID)
+          await this.#finishTurnSoon(sessionID, "idle")
           return
         }
         if (kind === "busy") {
@@ -2647,9 +2670,9 @@ export class Bridge {
     const entry = existing ?? { conversationId, parts: [] }
     entry.parts.push(text)
     if (entry.timer) clearTimeout(entry.timer)
-    // A block that arrives after the turn's end signal only needs the short
-    // settle window; without a signal the full grace applies so the blocks of a
-    // still-running turn can merge.
+    // A new block means the turn is still producing text, so a step-end hint is
+    // stale: only a real end signal may shorten the wait.
+    this.#steppedTurns.delete(sessionID)
     const delay = this.#settledTurns.has(sessionID)
       ? Math.min(this.#config.turnSettleMs, this.#config.turnGraceMs)
       : this.#config.turnGraceMs
@@ -2665,15 +2688,18 @@ export class Bridge {
   }
 
   /**
-   * A turn-completion signal arrived: shorten the pending wait.
+   * A completion signal (or a step boundary) arrived: shorten the pending wait.
    *
    * The final text block can arrive just after the signal, so this does not
    * flush immediately — it replaces the full grace (`turnGraceMs`, 3 s) with the
-   * short settle window (`turnSettleMs`, 0.6 s). Every reply used to pay the
-   * full grace because the only signal the host actually sent was unreliable.
+   * short settle window (`turnSettleMs`, 0.6 s). Real signals (`session.idle`,
+   * `session.status: idle`, `session.execution.succeeded`) are authoritative;
+   * a step boundary is only a hint and `#relaxTurn` undoes it when the turn
+   * turns out to continue.
    */
-  async #finishTurnSoon(sessionID: string): Promise<void> {
-    this.#settledTurns.add(sessionID)
+  async #finishTurnSoon(sessionID: string, trigger: "idle" | "step"): Promise<void> {
+    if (trigger === "idle") this.#settledTurns.add(sessionID)
+    else this.#steppedTurns.add(sessionID)
     const settle = Math.max(0, Math.min(this.#config.turnSettleMs, this.#config.turnGraceMs))
     const turn = this.#turns.get(sessionID)
     const live = this.#live.get(sessionID)
@@ -2684,7 +2710,7 @@ export class Bridge {
       return
     }
     const finish = (): void => {
-      void this.#finishTurn(sessionID, "idle").catch((error) =>
+      void this.#finishTurn(sessionID, trigger === "step" ? "step" : "idle").catch((error) =>
         this.#log.warn(`turn flush failed: ${errorText(error)}`),
       )
     }
@@ -2704,9 +2730,32 @@ export class Bridge {
     }
   }
 
+  /**
+   * The turn is still going (a tool call or a new step): put the full grace back.
+   *
+   * Only undoes a *step-end hint*; a real end signal is not negotiable, because
+   * the host only sends it when the turn is over.
+   */
+  #relaxTurn(sessionID: string): void {
+    if (!this.#steppedTurns.delete(sessionID)) return
+    if (this.#settledTurns.has(sessionID)) return
+    const turn = this.#turns.get(sessionID)
+    if (!turn?.timer) return
+    clearTimeout(turn.timer)
+    turn.timer = setTimeout(
+      () =>
+        void this.#finishTurn(sessionID, "timer").catch((error) =>
+          this.#log.warn(`turn flush failed: ${errorText(error)}`),
+        ),
+      this.#config.turnGraceMs,
+    )
+    turn.timer.unref?.()
+  }
+
   /** A turn ended: deliver whatever is left and stop the "typing" indicator. */
-  async #finishTurn(sessionID: string, trigger: "idle" | "timer" | "failed" = "idle"): Promise<void> {
+  async #finishTurn(sessionID: string, trigger: "idle" | "timer" | "step" | "failed" = "idle"): Promise<void> {
     this.#settledTurns.delete(sessionID)
+    this.#steppedTurns.delete(sessionID)
     const turn = this.#turns.get(sessionID)
     this.#turns.delete(sessionID)
     if (turn?.timer) clearTimeout(turn.timer)

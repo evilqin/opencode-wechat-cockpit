@@ -34,7 +34,7 @@ opencode **主动向外长轮询**腾讯 iLink 网关，所以电脑开着、ope
 | 🔁 **半截回答也能收全** | 多段回答自带编号 `（1/3）…`，被限流时入队并自动补发；`/more`（`/继续`）区分两种情况：**有卡住的就补发（不叫模型），确实没写完才让模型接着写** |
 | 🔁 **重复消息不花钱** | `message_id` 去重（最近 200 条），重复投递直接忽略，不会重复调用模型 |
 | 📚 **手机上就能查手册** | `/help` 总览、`/help 命令` 单条、`/help 全部` 全文；`MANUAL.md` 与代码同源自动生成；`/list` 支持翻页 |
-| 🧪 **有测试套件** | 200 个自动化测试（单元 + mock iLink 协议 + 假 ctx 行为测试）+ strict 类型检查（含 `noUnusedLocals`），真机验证记录见文末 |
+| 🧪 **有测试套件** | 202 个自动化测试（单元 + mock iLink 协议 + 假 ctx 行为测试）+ strict 类型检查（含 `noUnusedLocals`），真机验证记录见文末 |
 
 
 ## 最快上手
@@ -277,11 +277,11 @@ bun ...login-cli.ts --force    # 已登录时强制重新扫码
 **游标先落盘。** 长轮询游标在处理消息之前就写入状态文件，进程崩了是重放而不是丢消息。
 
 **回复按轮发送，但不干等。** 微信不能编辑消息，逐字流式只会刷屏，所以默认攒一整轮再发
-（`stream: live` 可以打开实时推送）。v2 里真正的"本轮结束"信号是 `session.status`（`status.type: "idle"`）
-与 `session.execution.succeeded`（`session.idle` 在真机上从不触发），收到它之后只等 `turnSettleMs`
-（默认 0.6 秒）确认窗就发出——给最后一块文本留出合并时间。如果连这个信号都没来，还有 `turnGraceMs`
-（默认 3 秒）兜底：文本停下来这么久就发送。日志里 `reply sent (trigger: idle)` 是信号路径，
-`trigger: timer` 是兜底路径（说明当时没收到信号）。
+（`stream: live` 可以打开实时推送）。结束判断按可靠性从高到低：`session.status`（`status.type: "idle"`）与
+`session.execution.succeeded`（v2 的正式结束信号）→ 只等 `turnSettleMs`（默认 0.6 秒）确认窗；
+**每一步结束**（`session.step.ended`）也当作加速提示（同样 0.6 秒，但一旦后面有工具调用或新文本就撤销，
+所以多步回答不会被切碎）；真的什么信号都没有时，才退回 `turnGraceMs`（默认 3 秒）兜底。
+日志 `reply sent (trigger: idle|step|timer)` 能看出走的是哪条路（`timer` = 兜底）。
 
 **本地 API。** 插件上下文没有「会话列表」和「表单回复」这两块能力，于是插件直接读
 `~/.local/state/opencode/service.json`（`$XDG_STATE_HOME` 优先，`WECHAT_SERVICE_FILE` 可覆盖）
@@ -299,7 +299,7 @@ bun $env:USERPROFILE\.config\opencode\plugins\wechat\verify.ts
 | 症状 | 原因与处理 |
 | --- | --- |
 | 发消息没反应 | 日志里没有 `poller started`：先登录。锁有心跳但 `polledAt` 很旧：2 分钟内会被别的实例接管 |
-| 电脑上答完、微信慢半分钟 | 正常路径是"结束信号 + `turnSettleMs`（0.6 秒）"；只有信号没来时才会等 `turnGraceMs`（3 秒）再加被拒重试的退避。日志 `reply sent (trigger: …)` 能看出走的是哪条路 |
+| 电脑上答完、微信慢半分钟 | 正常路径是"结束信号 / 步结束 + `turnSettleMs`（0.6 秒）"；只有什么信号都没来才等 `turnGraceMs`（3 秒）再加被拒重试的退避。日志 `reply sent (trigger: …)` 能看出走的是哪条路 |
 | 回答没回到微信 | 日志找 `send refused`；`-2 prepare failed` 是窗口关了（会自动补发），`-14` 是 token 失效 |
 | 回答只发了一半 | 多段回答会标 `（1/3）（2/3）…`，缺号就是被限流了：发 `/more` 补发（有卡住的东西时**只补发、不叫模型**）；确实没写完再发一次 `/more` 让模型续写 |
 | 手机收到灰框图片 | `aes_key` 编码错了（必须是 hex 文本的 base64）——本插件已对齐，若出现请提 issue |
@@ -316,7 +316,7 @@ bun $env:USERPROFILE\.config\opencode\plugins\wechat\verify.ts
 ```powershell
 cd $env:USERPROFILE\.config\opencode\plugins\wechat
 cd types; bun install    # 一次性：类型检查用的官方类型（types/ 被 gitignore）
-bun test                 # 200 个测试：单元 + mock iLink + 假 ctx 驱动的 Bridge 行为
+bun test                 # 202 个测试：单元 + mock iLink + 假 ctx 驱动的 Bridge 行为
 bun run typecheck        # strict 检查（缺依赖时会提示上面那句安装命令）
 bun verify.ts            # 环境自检
 bun gen-manual.ts        # 改了 manual.ts 之后重新生成 MANUAL.md

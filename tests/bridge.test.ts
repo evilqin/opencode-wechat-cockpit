@@ -2139,6 +2139,37 @@ describe("hardening (audit follow-up)", () => {
     expect(logs.some((line) => line.includes("provider retry"))).toBe(true)
   })
 
+  test("a step end shortens the wait, and a following tool call undoes it", async () => {
+    const { bridge } = await harness({ turnGraceMs: 30_000, turnSettleMs: 40 })
+    await bridge.handleInbound(inbound("/new 我的会话"))
+    clearSent()
+
+    await bridge.handleEvent({
+      type: "session.text.ended",
+      data: { sessionID: "ses_test1", assistantMessageID: "msg_1", ordinal: 0, text: "第一块文本" },
+    })
+    await bridge.handleEvent({ type: "session.step.ended", data: { sessionID: "ses_test1" } })
+    // The tool starts before the settle window elapses: the turn continues, so
+    // the block must NOT be flushed as if the turn were over.
+    await bridge.handleEvent({
+      type: "session.tool.called",
+      data: { sessionID: "ses_test1", id: "bash", input: { command: "ls" } },
+    })
+    await new Promise((resolve) => setTimeout(resolve, 120))
+    expect(sentTexts().filter((text) => text.includes("第一块"))).toEqual([])
+
+    // The turn really ends now: text, step, and the settle window delivers.
+    await bridge.handleEvent({
+      type: "session.text.ended",
+      data: { sessionID: "ses_test1", assistantMessageID: "msg_1", ordinal: 1, text: "第二块文本" },
+    })
+    await bridge.handleEvent({ type: "session.step.ended", data: { sessionID: "ses_test1" } })
+    const started = Date.now()
+    await waitForText("第二块文本", 5_000)
+    expect(Date.now() - started).toBeLessThan(3_000)
+    expect(sentTexts().filter((text) => text.includes("块文本"))).toEqual(["第一块文本\n\n第二块文本"])
+  })
+
   test("sendToLast reports a refusal instead of throwing", async () => {    const { bridge } = await harness()
     await bridge.handleInbound(inbound("/new 我的会话"))
     ilink.refuseSends = true
