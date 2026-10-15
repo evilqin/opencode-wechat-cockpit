@@ -49,7 +49,8 @@ export function parseDecision(text: string): PermissionDecision | undefined {
 
 /** `1`, `2`, `3`, or an explicit verb — used by `/allow` and `/deny` too. */
 export function parseSelector(argument: string): { index?: number; all: boolean; invalid?: boolean } {
-  const value = argument.trim().toLowerCase()
+  // NFKC: a full-width digit from a Chinese IME must resolve like an ASCII one.
+  const value = argument.normalize("NFKC").trim().toLowerCase()
   if (!value) return { all: false }
   if (value === "all" || value === "*" || value === "全部" || value === "所有") return { all: true }
   // Approval is security-relevant: `2x`, `3.9` or `abc` must not silently select

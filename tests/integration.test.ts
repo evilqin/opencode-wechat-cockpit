@@ -19,8 +19,8 @@ import { tmpdir } from "node:os"
 import { join } from "node:path"
 
 import { login, sendItems, sendText, imageItem, type WeixinAccount } from "../ilink.ts"
-import { ChannelMonitor } from "../monitor.ts"
-import { prepareAttachment } from "../media.ts"
+import { ChannelMonitor, clampPollTimeout } from "../monitor.ts"
+import { fetchMedia, prepareAttachment } from "../media.ts"
 
 interface Recorded {
   path: string
@@ -434,7 +434,8 @@ describe("outbound media", () => {
       msg_id: "999999999999",
       image_item: {
         aeskey: state.downloadAesKey.toString("hex"),
-        mid_size: 64,
+        // 14 plaintext bytes + PKCS#7 padding = 16 ciphertext bytes.
+        mid_size: 16,
         media: { full_url: `${baseUrl}/download`, encrypt_type: 1 },
       },
     }
@@ -444,6 +445,26 @@ describe("outbound media", () => {
     expect(result.media?.bytes).toBe(state.downloadBytes.byteLength)
     expect(readFileSync(result.media!.path).equals(state.downloadBytes)).toBe(true)
     expect(result.media?.kind).toBe("image")
+    rmSync(result.media!.path, { force: true })
+  })
+
+  test("a size that does not match the declaration is delivered with a warning", async () => {
+    const { downloadItem } = await import("../media.ts")
+    const item = {
+      type: 2,
+      msg_id: "999999999998",
+      image_item: {
+        aeskey: state.downloadAesKey.toString("hex"),
+        // The service says 4 KB; a truncated body (portal page, reset
+        // connection) must not be passed off silently as the real image.
+        mid_size: 4096,
+        media: { full_url: `${baseUrl}/download`, encrypt_type: 1 },
+      },
+    }
+
+    const result = await downloadItem({ account: { accountId: "bot@im.bot", token: "t", baseUrl }, item })
+    expect(result.media).toBeDefined()
+    expect(result.note).toContain("大小与声明不符")
     rmSync(result.media!.path, { force: true })
   })
 
@@ -594,5 +615,88 @@ describe("local api", () => {
     expect(await api.info()).toBeUndefined()
     expect(api.available).toBe(false)
     process.env.WECHAT_SERVICE_FILE = registrationFile
+  })
+})
+
+describe("protocol hardening", () => {
+  test("fetchMedia refuses non-https and untrusted hosts", async () => {
+    // The URL comes from a getupdates answer. On Bun `fetch("file://…")` reads
+    // local files — the state file with the bot token included.
+    expect(await fetchMedia({ ref: { full_url: "file:///C:/Windows/win.ini" } })).toBeUndefined()
+    expect(await fetchMedia({ ref: { full_url: "https://attacker.example/x" } })).toBeUndefined()
+    expect(await fetchMedia({ ref: { full_url: "http://ilinkai.weixin.qq.com/x" } })).toBeUndefined()
+    // Loopback is how the tests' mock server is reached; it must still work.
+    state.downloadBytes = Buffer.from("inbound-bytes")
+    const ok = await fetchMedia({ ref: { full_url: `${baseUrl}/download` } })
+    expect(ok?.byteLength).toBeGreaterThan(0)
+  })
+
+  test("sendText reuses a provided client id so a retry is idempotent", async () => {
+    const account: WeixinAccount = { accountId: "bot@im.bot", token: "token-1", baseUrl }
+    state.requests.length = 0
+    await sendText({ account, to: "user@im.wechat", text: "重试也要同一条", clientId: "opencode-wechat:fixed-id" })
+    await sendText({ account, to: "user@im.wechat", text: "重试也要同一条", clientId: "opencode-wechat:fixed-id" })
+    const sends = state.requests.filter((entry) => entry.path === "POST /ilink/bot/sendmessage")
+    expect(sends).toHaveLength(2)
+    const ids = sends.map((entry) => (entry.body.msg as { client_id?: string }).client_id)
+    expect(ids).toEqual(["opencode-wechat:fixed-id", "opencode-wechat:fixed-id"])
+  })
+
+  test("a type-confused batch is a protocol error, not a crash loop", async () => {
+    const account: WeixinAccount = { accountId: "bot@im.bot", token: "token-1", baseUrl, userId: "user@im.wechat" }
+    state.updates = [{ buf: "cursor-weird", msgs: {} as unknown as [] }]
+    const errors: string[] = []
+    const controller = new AbortController()
+    const monitor = new ChannelMonitor({
+      account,
+      onMessage: async () => {
+        throw new Error("a malformed batch must not dispatch")
+      },
+      onError: (error) => {
+        errors.push(error instanceof Error ? error.message : String(error))
+        if (errors.length >= 1) controller.abort()
+      },
+    })
+    expect(await monitor.run(controller.signal)).toBe("aborted")
+    expect(errors.some((message) => message.includes("msgs 不是数组"))).toBe(true)
+  })
+
+  test("a mid-batch failure rewinds the cursor so nothing is skipped", async () => {
+    const account: WeixinAccount = { accountId: "bot@im.bot", token: "token-1", baseUrl, userId: "user@im.wechat" }
+    state.updates = [
+      {
+        buf: "cursor-batch",
+        msgs: [
+          { message_id: "411111111111111111", from_user_id: "user@im.wechat", message_type: 1, item_list: [{ type: 1, text_item: { text: "第一条" } }] },
+          { message_id: "422222222222222222", from_user_id: "user@im.wechat", message_type: 1, item_list: [{ type: 1, text_item: { text: "第二条" } }] },
+        ],
+      },
+    ]
+    const cursors: string[] = []
+    const received: string[] = []
+    const controller = new AbortController()
+    const monitor = new ChannelMonitor({
+      account,
+      initialSyncBuf: "cursor-start",
+      onMessage: async (message) => {
+        received.push(message.text)
+        if (received.length === 2) throw new Error("处理这条时炸了")
+      },
+      onSyncBuf: (buf) => {
+        cursors.push(buf)
+      },
+      onError: (error) => {
+        if (error instanceof Error && error.message.includes("游标已回退")) controller.abort()
+      },
+    })
+    expect(await monitor.run(controller.signal)).toBe("aborted")
+    expect(cursors).toEqual(["cursor-batch", "cursor-start"])
+    expect(received).toEqual(["第一条", "第二条"])
+  })
+
+  test("a nonsense poll timeout suggestion is clamped", () => {
+    expect(clampPollTimeout(1e9)).toBe(90_000)
+    expect(clampPollTimeout(1)).toBe(5_000)
+    expect(clampPollTimeout(40_000)).toBe(40_000)
   })
 })

@@ -34,7 +34,7 @@ opencode **主动向外长轮询**腾讯 iLink 网关，所以电脑开着、ope
 | 🔁 **半截回答也能收全** | 多段回答自带编号 `（1/3）…`，被限流时入队并自动补发；`/more`（`/继续`）区分两种情况：**有卡住的就补发（不叫模型），确实没写完才让模型接着写** |
 | 🔁 **重复消息不花钱** | `message_id` 去重（最近 200 条），重复投递直接忽略，不会重复调用模型 |
 | 📚 **手机上就能查手册** | `/help` 总览、`/help 命令` 单条、`/help 全部` 全文；`MANUAL.md` 与代码同源自动生成；`/list` 支持翻页 |
-| 🧪 **有测试套件** | 174 个自动化测试（单元 + mock iLink 协议 + 假 ctx 行为测试）+ strict 类型检查（含 `noUnusedLocals`），真机验证记录见文末 |
+| 🧪 **有测试套件** | 200 个自动化测试（单元 + mock iLink 协议 + 假 ctx 行为测试）+ strict 类型检查（含 `noUnusedLocals`），真机验证记录见文末 |
 
 
 ## 最快上手
@@ -98,13 +98,14 @@ Windows / macOS / Linux 都可以（Windows 是主力开发和真机验证平台
 bun $env:USERPROFILE\.config\opencode\plugins\wechat\login-cli.ts
 ```
 
-扫码并在手机上确认。凭据存在 `~/.config/opencode/wechat/state.json`（权限 0600）。
+扫码并在手机上确认。凭据存在 `~/.config/opencode/wechat/state.json`（POSIX 上 0600；Windows 上由用户目录 ACL 保护）。
 
 也可以不动终端：在 opencode 会话里输入 `/wechat-login`，二维码会作为消息出现在会话里。
 
 ```powershell
 bun ...login-cli.ts --status   # 看绑定、目录、会话数
-bun ...login-cli.ts --logout   # 清除本地凭据
+bun ...login-cli.ts --logout   # 清除本地凭据（保留旧 token 以便重新绑定同一个 bot）
+bun ...login-cli.ts --purge    # 连旧 token 一起清掉（下次扫码会创建新绑定）
 bun ...login-cli.ts --force    # 已登录时强制重新扫码
 ```
 
@@ -149,8 +150,9 @@ bun ...login-cli.ts --force    # 已登录时强制重新扫码
 | 场景 | 做法 |
 | --- | --- |
 | agent 要审批 | 微信收到「🔐 需要你确认」，回 `1`=允许一次 `2`=总是允许 `3`=拒绝 |
-| 多个待审批 | `/allow 序号`、`/always 序号`、`/deny 序号`、`/deny all` |
-| agent 提问（选择题/填空） | 微信收到「❓ …」，回 `/answer 答案`；多问题用 `/answer 1=答案; 2=答案` |
+| 多个待审批 | `/allow 序号`、`/always 序号`、`/deny 序号`、`/deny all`、`/allow all`（一次全批准） |
+| agent 提问（选择题/填空） | 微信收到「❓ …」，回 `/answer 答案`；多问题用 `/answer 1=答案; 2=答案`；**同时有多个提问**用 `/answer #2 答案` 指定第几个 |
+| 输入法打出全角 | 命令和数字都做 NFKC 归一：`／列表 ２`、`/attach ３` 与半角等效 |
 
 审批和提问都会**等你回答**：回答前那一步不会继续，所以你离开电脑也不会卡死——
 这是这个插件存在的主要理由。
@@ -226,7 +228,8 @@ bun ...login-cli.ts --force    # 已登录时强制重新扫码
   "progress": "tools",             // tools=每个工具调用发一行；off=只发最终回答
   "stream": "off",                 // live=边生成边发（长任务在手机上更有反馈）
   "streamIntervalMs": 8000,        // live 模式的推送间隔
-  "turnGraceMs": 3000,             // 文本结束后最多再等多久就发送（回复延迟的来源）
+  "turnGraceMs": 3000,             // 没有结束信号时最多再等多久就发送（回复延迟的上限）
+  "turnSettleMs": 600,             // 收到「本轮结束」信号（session.status/…succeeded）后的确认窗
   "mirrorAll": false,              // 是否允许非微信会话推送结果到微信
   "followActive": false,           // 自动跟随电脑上正在用的会话
   "followHoldMs": 300000,          // 手动切换后多久内不被自动跟随打扰
@@ -274,10 +277,11 @@ bun ...login-cli.ts --force    # 已登录时强制重新扫码
 **游标先落盘。** 长轮询游标在处理消息之前就写入状态文件，进程崩了是重放而不是丢消息。
 
 **回复按轮发送，但不干等。** 微信不能编辑消息，逐字流式只会刷屏，所以默认攒一整轮再发
-（`stream: live` 可以打开实时推送）。整轮结束的信号是 `session.idle`；v2 上它并不总是及时
-到达，因此还有一个 `turnGraceMs`（默认 3 秒）兜底：文本停下来这么久就发送。**这个值就是
-「电脑上已经答完、手机上却还没到」的那段延迟**（实测原来 30 秒，压到 3 秒后几乎同时到达）。
-日志里 `reply sent (trigger: timer)` 表示是兜底发的，`trigger: idle` 表示拿到了正常的结束信号。
+（`stream: live` 可以打开实时推送）。v2 里真正的"本轮结束"信号是 `session.status`（`status.type: "idle"`）
+与 `session.execution.succeeded`（`session.idle` 在真机上从不触发），收到它之后只等 `turnSettleMs`
+（默认 0.6 秒）确认窗就发出——给最后一块文本留出合并时间。如果连这个信号都没来，还有 `turnGraceMs`
+（默认 3 秒）兜底：文本停下来这么久就发送。日志里 `reply sent (trigger: idle)` 是信号路径，
+`trigger: timer` 是兜底路径（说明当时没收到信号）。
 
 **本地 API。** 插件上下文没有「会话列表」和「表单回复」这两块能力，于是插件直接读
 `~/.local/state/opencode/service.json`（`$XDG_STATE_HOME` 优先，`WECHAT_SERVICE_FILE` 可覆盖）
@@ -295,7 +299,7 @@ bun $env:USERPROFILE\.config\opencode\plugins\wechat\verify.ts
 | 症状 | 原因与处理 |
 | --- | --- |
 | 发消息没反应 | 日志里没有 `poller started`：先登录。锁有心跳但 `polledAt` 很旧：2 分钟内会被别的实例接管 |
-| 电脑上答完、微信慢半分钟 | 回复延迟 = `turnGraceMs`（默认 3 秒）+ 被拒时的重试退避；日志 `reply sent (trigger: …)` 能看出是哪条路 |
+| 电脑上答完、微信慢半分钟 | 正常路径是"结束信号 + `turnSettleMs`（0.6 秒）"；只有信号没来时才会等 `turnGraceMs`（3 秒）再加被拒重试的退避。日志 `reply sent (trigger: …)` 能看出走的是哪条路 |
 | 回答没回到微信 | 日志找 `send refused`；`-2 prepare failed` 是窗口关了（会自动补发），`-14` 是 token 失效 |
 | 回答只发了一半 | 多段回答会标 `（1/3）（2/3）…`，缺号就是被限流了：发 `/more` 补发（有卡住的东西时**只补发、不叫模型**）；确实没写完再发一次 `/more` 让模型续写 |
 | 手机收到灰框图片 | `aes_key` 编码错了（必须是 hex 文本的 base64）——本插件已对齐，若出现请提 issue |
@@ -312,7 +316,7 @@ bun $env:USERPROFILE\.config\opencode\plugins\wechat\verify.ts
 ```powershell
 cd $env:USERPROFILE\.config\opencode\plugins\wechat
 cd types; bun install    # 一次性：类型检查用的官方类型（types/ 被 gitignore）
-bun test                 # 174 个测试：单元 + mock iLink + 假 ctx 驱动的 Bridge 行为
+bun test                 # 200 个测试：单元 + mock iLink + 假 ctx 驱动的 Bridge 行为
 bun run typecheck        # strict 检查（缺依赖时会提示上面那句安装命令）
 bun verify.ts            # 环境自检
 bun gen-manual.ts        # 改了 manual.ts 之后重新生成 MANUAL.md
@@ -386,7 +390,7 @@ Select-String -Path ~/.config/opencode/node_modules/@opencode/client/dist/promis
 - 只连腾讯官方 iLink 网关（`ilinkai.weixin.qq.com` 及其返回的同一 IDC 主机），没有第三方中转。
 - 扫码后 bot 与你的微信号是密码学绑定的：服务端只投递这一个账号的消息，机器人不是微信
   联系人、搜不到、别人加不了。想再加一层，用 `allowedUsers` 白名单。
-- 凭据只存本地（0600，放在 `~/.config/opencode/wechat/`，**不在本仓库里**），不写入任何仓库。
+- 凭据只存本地（POSIX 上 0600、Windows 上继承用户目录 ACL，放在 `~/.config/opencode/wechat/`，**不在本仓库里**），不写入任何仓库。
 - **agent 以你的身份运行**：微信来的会话默认继承你的权限设置，需要审批的会发到微信。
   想让 agent 干活更顺，放宽默认 agent 的权限；想更稳，保持审批开着。
 
@@ -400,6 +404,6 @@ Select-String -Path ~/.config/opencode/node_modules/@opencode/client/dist/promis
 - opencode v2 插件 API 目前是 beta，接口变化时需要跟着改。
 - 微信会话建在**默认目录**（默认 `~`）里，所以它出现在那个目录对应的 opencode 项目下。
   想让它长在某个仓库里，先 `/dir D:\code\repo` 再 `/new`。
-- **网络超时导致的重试可能重复投递**：发送超时属于"不确定"（服务端可能已收），插件会选择重试；
-  如果服务端没有按 `client_id` 幂等，同一条消息可能到两次。宁可重复也不丢消息，是刻意的取舍。
+- **发送超时不会重复投递**：每条待发消息带一个稳定的 `client_id`（重试、上下文回退、插件重载都复用同一个），
+  服务端按它去重。所以"宁可重复也不丢"的取舍已经不适用：超时会重试，但不会到两次。
 - 接收到的附件在 `~/.config/opencode/wechat/inbox`：保留 **14 天或 512MB**（先到者为准），旧的自动清理。

@@ -7,7 +7,8 @@
  *    tokens, and the WeChat-conversation → OpenCode-session bindings.
  *  - `lock.json` — who is currently polling, with a heartbeat.
  *
- * The bot token is a credential, so the files are written 0600 and never
+ * The bot token is a credential, so the files are written 0600 (on Windows the
+ * mode bits do not apply and they inherit the profile's ACL) and never
  * logged. They are deliberately outside any repository.
  */
 
@@ -50,9 +51,30 @@ export interface SessionBinding {
 /** How many handled message ids are remembered for duplicate suppression. */
 export const SEEN_MESSAGE_LIMIT = 200
 
+export interface QueuedMessage {
+  text: string
+  /**
+   * Client-side id, kept across every retry of this message.
+   *
+   * The service dedupes on `client_id`, so an ambiguous timeout (the answer was
+   * lost *after* the service accepted it) no longer delivers a duplicate when
+   * the message is retried — which is what the old "宁可重复也不丢" trade-off
+   * was paying for.
+   */
+  clientId: string
+}
+
 export interface State {
   version: 1
   account?: WeixinAccount
+  /**
+   * Tokens from earlier logins, kept only to offer as `local_token_list`.
+   *
+   * The server reuses an existing binding when the client presents the token it
+   * bound with; dropping it on `--logout` made the next scan create a *second*
+   * bot instead of rebinding the existing one.
+   */
+  previousTokens?: string[]
   /** Long-poll cursor: persisted before dispatch so restarts replay, not drop. */
   syncBuf?: string
   /** conversationId → `context_token` of the latest inbound message. */
@@ -75,7 +97,9 @@ export interface State {
    * enough) and losing a finished answer to a reload would be invisible to
    * everyone: the agent believes it reported, the user sees nothing.
    */
-  pendingOutbound?: Record<string, string[]>
+  pendingOutbound?: Record<string, Array<QueuedMessage | string>>
+  /** When each conversation's queue first appeared (for expiry of parked ones). */
+  pendingOutboundSince?: Record<string, number>
   /** Retry attempt counters for the pending queue, per conversation. */
   pendingOutboundAttempts?: Record<string, number>
   /**
@@ -167,30 +191,62 @@ export function readState(): State {
   }
 }
 
-/** Write the state atomically and privately (0600). */
+/** Write the state atomically and privately (0600 on POSIX, profile ACL on Windows). */
 export function writeState(state: State): void {
   ensureStateDir()
   writePrivate(STATE_PATH, JSON.stringify(state, null, 2))
 }
 
+/** JSC/Node-compatible synchronous sleep, for retry loops inside sync code. */
+const sleepCell = new Int32Array(new SharedArrayBuffer(4))
+function sleepSync(ms: number): void {
+  try {
+    Atomics.wait(sleepCell, 0, 0, ms)
+  } catch {
+    // Atomics.wait is not available on the main thread in some runtimes; a
+    // busy-wait for a few milliseconds is acceptable here.
+    const until = Date.now() + ms
+    while (Date.now() < until) {
+      /* spin */
+    }
+  }
+}
+
+/**
+ * Write atomically and privately (0600 on POSIX; on Windows the file inherits
+ * the directory ACL, because the mode bits do not apply there).
+ *
+ * The rename is retried a few times: on Windows an anti-virus scanner, the
+ * search indexer or a backup tool holding the file produces a transient
+ * EPERM/EBUSY/EACCES, and a single failure used to be fatal for that write.
+ */
 export function writePrivate(path: string, content: string): void {
   ensureStateDir()
   // Unique temp name: several plugin instances share one process, so a
   // PID-based name would let two writers clobber each other's temp file.
   const tmp = `${path}.${process.pid}.${randomUUID()}.tmp`
   writeFileSync(tmp, content, { mode: 0o600 })
-  try {
-    renameSync(tmp, path)
-  } catch (error) {
-    // A failed rename (a Windows sharing violation while another instance reads
-    // the file, or a killed process) must not leave the temp file behind for
-    // years — that is how eight of them piled up in the state directory.
+  const retryable = new Set(["EPERM", "EACCES", "EBUSY", "ENOTEMPTY"])
+  for (let attempt = 1; ; attempt += 1) {
     try {
-      rmSync(tmp, { force: true })
-    } catch {
-      // Best effort.
+      renameSync(tmp, path)
+      return
+    } catch (error) {
+      const code = (error as NodeJS.ErrnoException).code ?? ""
+      if (attempt < 3 && retryable.has(code)) {
+        sleepSync(attempt === 1 ? 10 : 25)
+        continue
+      }
+      // A failed rename (a Windows sharing violation while another instance
+      // reads the file, or a killed process) must not leave the temp file
+      // behind for years — that is how eight of them piled up.
+      try {
+        rmSync(tmp, { force: true })
+      } catch {
+        // Best effort.
+      }
+      throw error
     }
-    throw error
   }
 }
 
@@ -233,6 +289,84 @@ export function updateState(mutate: (state: State) => void): State {
 
 /*
  * ---------------------------------------------------------------------------
+ * Login hygiene
+ * ---------------------------------------------------------------------------
+ */
+
+/** Path of the login QR image (a scannable credential). */
+export const QR_PNG_PATH = process.env.WECHAT_QR_PNG ?? join(STATE_DIR, "qr.png")
+
+/** Delete the QR image (best effort). */
+export function removeQrPng(): void {
+  try {
+    rmSync(QR_PNG_PATH, { force: true })
+  } catch {
+    // Best effort.
+  }
+}
+
+/**
+ * Delete a QR image left behind by an abandoned login.
+ *
+ * The bitmap binds whoever scans it to this machine's agent — which runs with
+ * the user's permissions — so it must not sit in the config directory for weeks
+ * after the flow was given up on.
+ */
+export function pruneQrPng(maxAgeMs: number = 60 * 60_000): boolean {
+  try {
+    if (Date.now() - statSync(QR_PNG_PATH).mtimeMs < maxAgeMs) return false
+    rmSync(QR_PNG_PATH, { force: true })
+    return true
+  } catch {
+    return false
+  }
+}
+
+/**
+ * One login flow at a time.
+ *
+ * The TUI command and the CLI can be started at once; each reads the existing
+ * tokens before either writes, so two QR codes race for the same state file and
+ * one of the two bindings the server created is orphaned. Returns a release
+ * function, or `undefined` when another login is already running.
+ */
+export function acquireLoginLock(ttlMs: number = 2 * 60_000): (() => void) | undefined {
+  ensureStateDir()
+  const path = join(STATE_DIR, "login.lock")
+  const claim = (): boolean => {
+    try {
+      writeFileSync(path, JSON.stringify({ pid: process.pid, at: Date.now() }), { flag: "wx", mode: 0o600 })
+      return true
+    } catch {
+      return false
+    }
+  }
+  if (!claim()) {
+    try {
+      const info = JSON.parse(readFileSync(path, "utf8")) as { at?: number }
+      if (typeof info.at === "number" && Date.now() - info.at < ttlMs) return undefined
+    } catch {
+      // Unreadable lock: fall through and replace it.
+    }
+    try {
+      rmSync(path, { force: true })
+    } catch {
+      return undefined
+    }
+    if (!claim()) return undefined
+  }
+  return () => {
+    try {
+      const info = JSON.parse(readFileSync(path, "utf8")) as { pid?: number }
+      if (info.pid === process.pid) rmSync(path, { force: true })
+    } catch {
+      // Best effort.
+    }
+  }
+}
+
+/*
+ * ---------------------------------------------------------------------------
  * Lock
  * ---------------------------------------------------------------------------
  */
@@ -270,10 +404,28 @@ export interface LockHandle {
   /** Record poller liveness so a wedged owner can be detected from outside. */
   touchPolledAt: (info: { polledAt?: number; answeredAt?: number; timeouts?: number }) => void
   release: () => void
+  /**
+   * Whether the lock file still names this instance.
+   *
+   * Deliberately ignores heartbeat staleness: the owner must not abandon a slot
+   * just because a heartbeat write failed (AV, indexer, a sharing violation).
+   * A slot that another instance stole is detected anyway, because the file then
+   * names *that* instance. Standby instances still use the staleness-aware
+   * `lockOwnerInstanceId()` to decide when to take over.
+   */
+  isMine: () => boolean
 }
 
 /** A lock whose owner has not completed a poll for this long is wedged. */
 export const LOCK_POLL_STALE_MS = 120_000
+/**
+ * Minimum interval between heartbeat writes.
+ *
+ * The staleness window is `LOCK_STALE_MS` (60 s), so writing every 30 s halves
+ * the directory churn (one temp create+rename per tick, per instance) with a
+ * 2× safety margin.
+ */
+export const HEARTBEAT_INTERVAL_MS = 30_000
 
 /**
  * Try to become the single poller for this machine.
@@ -341,7 +493,11 @@ export function acquireLock(location: string): LockHandle | undefined {
       // revive itself would strand the slot (the owner would "lose" a lock
       // nobody else wants, forcing a needless handover).
       if (!stillOurs()) return
-      info.heartbeat = Date.now()
+      const now = Date.now()
+      // Written at most every 30 s: the staleness window is 60 s, so this leaves
+      // a 2× margin while halving the write rate of the whole state directory.
+      if (now - info.heartbeat < HEARTBEAT_INTERVAL_MS) return
+      info.heartbeat = now
       writePrivate(LOCK_PATH, JSON.stringify(info))
     } catch {
       // A failed heartbeat only matters if it persists; the next tick retries.
@@ -359,6 +515,13 @@ export function acquireLock(location: string): LockHandle | undefined {
   const touchPolledAt = (info2: { polledAt?: number; answeredAt?: number; timeouts?: number }): void => {
     try {
       if (!stillOurs()) return
+      // Only write when something actually changed: the tick runs every 10 s and
+      // used to rewrite an identical file each time.
+      const changed =
+        (info2.polledAt !== undefined && info2.polledAt !== info.polledAt) ||
+        (info2.answeredAt !== undefined && info2.answeredAt !== info.answeredAt) ||
+        (info2.timeouts !== undefined && info2.timeouts !== info.timeouts)
+      if (!changed) return
       if (info2.polledAt !== undefined) info.polledAt = info2.polledAt
       if (info2.answeredAt !== undefined) info.answeredAt = info2.answeredAt
       if (info2.timeouts !== undefined) info.timeouts = info2.timeouts
@@ -368,7 +531,7 @@ export function acquireLock(location: string): LockHandle | undefined {
     }
   }
 
-  return { info, refresh, touchPolledAt, release }
+  return { info, refresh, touchPolledAt, release, isMine: stillOurs }
 }
 
 /** Create the lock file only when it does not exist yet. */

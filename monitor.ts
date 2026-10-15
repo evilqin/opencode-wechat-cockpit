@@ -27,6 +27,7 @@ import {
   type WeixinAccount,
   type WeixinMessage,
   isMediaItem,
+  toCode,
 } from "./ilink.ts"
 
 /** A message ready to be handed to the bridge. */
@@ -55,6 +56,17 @@ export interface InboundMessage {
 }
 
 export type MonitorStopReason = "stale-token" | "aborted"
+
+/**
+ * Clamp the server's long-poll timeout suggestion.
+ *
+ * The value arrives in a poll answer, i.e. from the network: one claiming a day
+ * would hold the loop until the stall watchdog fires, and one claiming a
+ * millisecond would spin.
+ */
+export function clampPollTimeout(ms: number): number {
+  return Math.min(Math.max(ms, 5_000), 90_000)
+}
 
 export interface MonitorOptions {
   account: WeixinAccount
@@ -160,12 +172,13 @@ export class ChannelMonitor {
         continue
       }
 
-      if (typeof response.longpolling_timeout_ms === "number" && response.longpolling_timeout_ms > 0) {
-        this.#longPollTimeoutMs = response.longpolling_timeout_ms
+      const suggested = response.longpolling_timeout_ms
+      if (typeof suggested === "number" && suggested > 0) {
+        this.#longPollTimeoutMs = clampPollTimeout(suggested)
       }
       this.#lastActivityAt = Date.now()
 
-      const code = response.errcode ?? response.ret
+      const code = toCode(response.errcode ?? response.ret)
       if (code !== undefined && code !== 0) {
         if (code === STALE_TOKEN_ERRCODE) {
           this.#options.onStop?.("stale-token", "bot token 已失效，需要重新扫码绑定")
@@ -174,6 +187,18 @@ export class ChannelMonitor {
         this.#consecutiveFailures += 1
         this.#options.onError?.(
           new Error(`getupdates 失败 ret=${response.ret} errcode=${response.errcode} errmsg=${response.errmsg ?? ""}`),
+        )
+        await sleep(this.#failureDelay(), signal)
+        continue
+      }
+
+      // A type-confused answer (portal, middlebox) must not throw out of the
+      // loop: that crash-loop would restart the poller forever and drop the
+      // batch's cursor with it.
+      if (response.msgs !== undefined && !Array.isArray(response.msgs)) {
+        this.#consecutiveFailures += 1
+        this.#options.onError?.(
+          new Error(`getupdates 的 msgs 不是数组（${typeof response.msgs}），已按协议错误处理`),
         )
         await sleep(this.#failureDelay(), signal)
         continue
@@ -189,6 +214,9 @@ export class ChannelMonitor {
       }
 
       // Persist the cursor before dispatch: a crash while handling replays the batch.
+      // `batchStartBuf` is kept so an abort or a failing message can put it back —
+      // otherwise the next owner starts *after* messages nobody ever saw.
+      const batchStartBuf = this.#syncBuf
       if (response.get_updates_buf) {
         this.#syncBuf = response.get_updates_buf
         try {
@@ -199,11 +227,28 @@ export class ChannelMonitor {
         }
       }
 
+      const rewind = async (detail: string): Promise<void> => {
+        // Without a batch-start cursor there is nothing to rewind to; the
+        // in-memory cursor then stays as it is (the next owner gets the same
+        // replay guarantee from its own start position).
+        if (batchStartBuf === undefined || this.#syncBuf === batchStartBuf) return
+        this.#syncBuf = batchStartBuf
+        try {
+          await this.#options.onSyncBuf?.(batchStartBuf)
+        } catch (error) {
+          this.#options.onError?.(error)
+        }
+        this.#options.onError?.(
+          new Error(`${detail}；游标已回退到本批开头，这批消息会在下次轮询重放（去重窗口吸收重复）`),
+        )
+      }
+
       for (const raw of response.msgs ?? []) {
         // Ownership can change mid-batch (a handover, a hot reload). A disowned
         // poller must stop dispatching, or the rest of the batch is handled
         // twice — the exact race the pre-batch check exists to prevent.
         if (!this.#stillOwned()) {
+          await rewind("不再持有轮询锁，放弃本批剩余消息")
           this.#options.onStop?.("aborted", "不再持有轮询锁，放弃本批剩余消息")
           return "aborted"
         }
@@ -212,8 +257,11 @@ export class ChannelMonitor {
         try {
           await this.#options.onMessage(inbound)
         } catch (error) {
-          // One bad message must not kill the pump.
+          // One bad message must not kill the pump — but it must not be skipped
+          // either: rewind so the batch is redelivered and this message retried.
           this.#options.onError?.(error)
+          await rewind("处理消息失败")
+          break
         }
       }
     }

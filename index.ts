@@ -15,7 +15,7 @@ import { LocalApi } from "./api.ts"
 import { Bridge, errorText, renderForWechat } from "./bridge.ts"
 import { kindForPath, type OutboundKind } from "./media.ts"
 import { readConfig, writeConfig, type WechatConfig } from "./config.ts"
-import { ensureStateDir, STATE_DIR } from "./state.ts"
+import { acquireLoginLock, ensureStateDir, removeQrPng, STATE_DIR } from "./state.ts"
 import { login } from "./ilink.ts"
 
 type Ctx = Parameters<Parameters<typeof Plugin.define>[0]["setup"]>[0]
@@ -103,7 +103,10 @@ function makeLogger() {
     try {
       ensureStateDir()
       truncateIfLarge(LOG_PATH)
-      appendFileSync(LOG_PATH, line)
+      // 0600: the log holds message excerpts and is read back into the chat by
+      // `/log`. On Windows the mode bits do not apply and the file inherits the
+      // profile ACL instead.
+      appendFileSync(LOG_PATH, line, { mode: 0o600 })
     } catch {
       // Logging must never break the bridge.
     }
@@ -121,7 +124,7 @@ function truncateIfLarge(path: string): void {
   try {
     if (statSync(path).size < LOG_MAX_BYTES) return
     const lines = readFileSync(path, "utf8").split("\n")
-    writeFileSync(path, `${lines.slice(-400).join("\n")}\n`)
+    writeFileSync(path, `${lines.slice(-400).join("\n")}\n`, { mode: 0o600 })
   } catch {
     // No file yet, or a racing writer: the append below still works.
   }
@@ -312,11 +315,19 @@ async function registerCommands(ctx: Ctx, bridge: Bridge, log: { info: (m: strin
         const say = async (text: string) => {
           await ctx.session.synthetic({ sessionID, text }).catch(() => {})
         }
-        const existing = bridge.account?.token ? [bridge.account.token] : []
+        const releaseLogin = acquireLoginLock()
+        if (!releaseLogin) {
+          await say("已经有一个登录流程在进行（可能在终端里跑 login-cli.ts）。等它结束再试。")
+          return
+        }
+        const existing = [...new Set([
+          ...(bridge.state.previousTokens ?? []),
+          ...(bridge.account?.token ? [bridge.account.token] : []),
+        ])]
         if (bridge.account?.token) {
           await say(`已经登录过：${bridge.account.accountId}\n重新扫码会覆盖现有绑定，正在生成二维码…`)
         }
-        void login({
+        const flow = login({
           existingTokens: existing,
           onEventError: (error) => log.warn(`login event handler failed: ${errorText(error)}`),
           onEvent: async (event) => {
@@ -363,7 +374,15 @@ async function registerCommands(ctx: Ctx, bridge: Bridge, log: { info: (m: strin
                 break
             }
           },
-        }).catch((error) => void say(`❌ 登录流程出错：${errorText(error)}`))
+        })
+          .catch((error) => void say(`❌ 登录流程出错：${errorText(error)}`))
+          // Both the lock and the QR bitmap are credentials: they are released
+          // when the flow settles, not when this handler returns.
+          .finally(() => {
+            releaseLogin()
+            removeQrPng()
+          })
+        void flow
       },
     })
 
@@ -418,6 +437,7 @@ async function registerCommands(ctx: Ctx, bridge: Bridge, log: { info: (m: strin
                 "  /wechat-config stream off|live",
                 "  /wechat-config stream-interval <秒>",
                 "  /wechat-config grace <毫秒>（0 = 文本一结束就发；默认 3000）",
+                "  /wechat-config settle <毫秒>（收到「本轮结束」信号后的确认窗，默认 600）",
                 "  /wechat-config dir <路径>",
                 "  /wechat-config mirror on|off",
                 "  /wechat-config follow on|off",
@@ -456,6 +476,11 @@ async function registerCommands(ctx: Ctx, bridge: Bridge, log: { info: (m: strin
           case "grace": {
             const ms = Number.parseInt(value, 10)
             if (Number.isFinite(ms) && ms >= 0) next.turnGraceMs = ms
+            break
+          }
+          case "settle": {
+            const ms = Number.parseInt(value, 10)
+            if (Number.isFinite(ms) && ms >= 0) next.turnSettleMs = ms
             break
           }
           case "dir":
@@ -535,7 +560,7 @@ function describeConfig(config: WechatConfig, directory: string): string {
     "微信通道设置：",
     `进度提示：${config.progress === "tools" ? "显示工具调用" : "关闭"}（progress）`,
     `实时推送：${config.stream === "live" ? `开，每 ${Math.round(config.streamIntervalMs / 1000)} 秒` : "关"}（stream）`,
-    `回复延迟：文本结束后最多等 ${config.turnGraceMs} 毫秒（grace）`,
+    `回复延迟：无信号时最多等 ${config.turnGraceMs} 毫秒；收到本轮结束信号后只等 ${config.turnSettleMs} 毫秒（grace / settle）`,
     `默认目录：${directory}${directory === config.directory ? "" : "（/dir 覆盖）"}（dir）`,
     `镜像其他会话：${config.mirrorAll ? "开" : "关"}（mirror）`,
     `自动跟随：${config.followActive ? "开" : "关"}（follow，手动切换后 ${Math.round(config.followHoldMs / 60_000)} 分钟内不打扰）`,

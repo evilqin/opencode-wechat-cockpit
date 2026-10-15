@@ -182,19 +182,141 @@ export class ApiHttpError extends Error {
   readonly status: number
   readonly endpoint: string
   constructor(endpoint: string, status: number, body: string) {
-    super(`${endpoint} HTTP ${status}: ${body.slice(0, 300)}`)
+    // The body is echoed back by gateways (some debug-echo request headers) and
+    // this message is logged *and* forwarded to the phone, so credentials are
+    // stripped before that can happen.
+    super(`${endpoint} HTTP ${status}: ${redactSecrets(body).slice(0, 300)}`)
     this.name = "ApiHttpError"
     this.status = status
     this.endpoint = endpoint
   }
 }
 
+/**
+ * Normalise a wire error code.
+ *
+ * The gateway is JavaScript-shaped and has been seen sending codes as strings
+ * (`"0"`, `"-14"`). Comparing those with `=== 0` inverts every decision: an
+ * accepted send looks refused (the phone goes silent while the queue retries
+ * forever) and a dead token is retried instead of asking for a re-scan.
+ */
+export function toCode(value: unknown): number | undefined {
+  if (value === undefined || value === null) return undefined
+  if (typeof value === "number") return Number.isFinite(value) ? value : undefined
+  const parsed = Number(String(value).trim())
+  return Number.isFinite(parsed) ? parsed : undefined
+}
+
+/**
+ * Strip credential-shaped text before it reaches a log, a chat message or a
+ * tool result.
+ */
+export function redactSecrets(text: string): string {
+  return text
+    .replace(/(Bearer\s+)[A-Za-z0-9._~+/=-]{6,}/gi, "$1<已隐去>")
+    .replace(
+      /((?:bot_token|token|password|passwd|secret|aes_key|authorization|client_secret|verify_code|qrcode)\s*["']?\s*[:=]\s*["']?)[A-Za-z0-9._~+/=-]{6,}/gi,
+      "$1<已隐去>",
+    )
+    .replace(/\b[A-Za-z0-9_\-+/=]{40,}\b/g, "<已隐去>")
+}
+
+/** Hosts the bridge is willing to talk to. Anything else is treated as hostile. */
+const TRUSTED_HOST_SUFFIXES = [".weixin.qq.com", ".qq.com"] as const
+
+export function isTrustedHost(host: string): boolean {
+  const lowered = host.toLowerCase()
+  return TRUSTED_HOST_SUFFIXES.some((suffix) => lowered.endsWith(suffix))
+}
+
+/**
+ * Validate a URL that came from the network (QR status, `getupdates`, media).
+ *
+ * The bot token travels as a bearer header, so a hostile DNS/DHCP/portal answer
+ * that redirects the base URL would exfiltrate it. On Bun `fetch("file://…")`
+ * also reads local files, which would copy `state.json` into the inbox and hand
+ * it to the model. Only https to a trusted WeChat host is accepted; loopback is
+ * allowed because that is how the tests' mock servers work.
+ */
+export function assertTrustedUrl(url: string, what: string): URL {
+  let parsed: URL
+  try {
+    parsed = new URL(url)
+  } catch {
+    throw new Error(`${what} 不是合法 URL：${url.slice(0, 120)}`)
+  }
+  const host = parsed.hostname.toLowerCase()
+  if (host === "localhost" || host === "::1" || /^127\./.test(host)) return parsed
+  if (parsed.protocol !== "https:") {
+    throw new Error(`${what} 必须走 https，已拒绝：${parsed.protocol}//${parsed.host}`)
+  }
+  if (!isTrustedHost(host)) {
+    throw new Error(`${what} 指向非腾讯域名，已拒绝：${host}`)
+  }
+  return parsed
+}
+
+/** Whether a network URL is safe to fetch. */
+export function isTrustedUrl(url: string | undefined): boolean {
+  if (!url) return false
+  try {
+    assertTrustedUrl(url, "URL")
+    return true
+  } catch {
+    return false
+  }
+}
+
+/** Largest API answer the bridge is willing to buffer (a portal page is not). */
+const MAX_API_BODY_BYTES = 4 * 1024 * 1024
+
+/** Read a response body with a hard cap, so a hostile answer cannot exhaust memory. */
+async function readBoundedText(response: Response, maxBytes: number): Promise<string> {
+  const declared = Number(response.headers.get("content-length") ?? "")
+  if (Number.isFinite(declared) && declared > maxBytes) {
+    throw new Error(`响应体声明 ${declared} 字节，超过上限 ${maxBytes}`)
+  }
+  const reader = response.body?.getReader()
+  if (!reader) {
+    const text = await response.text()
+    if (Buffer.byteLength(text) > maxBytes) throw new Error(`响应体超过上限 ${maxBytes} 字节`)
+    return text
+  }
+  const chunks: Buffer[] = []
+  let total = 0
+  while (true) {
+    const { done, value } = await reader.read()
+    if (done) break
+    if (!value) continue
+    total += value.byteLength
+    if (total > maxBytes) {
+      await reader.cancel().catch(() => undefined)
+      throw new Error(`响应体超过上限 ${maxBytes} 字节`)
+    }
+    chunks.push(Buffer.from(value))
+  }
+  return Buffer.concat(chunks).toString("utf8")
+}
+
 const LOSSLESS_ID_FIELDS = ["message_id", "msg_id", "svr_id"] as const
 
-/** Parse a wire body without losing `uint64` precision on id fields. */
+/**
+ * Parse a wire body without losing `uint64` precision on id fields.
+ *
+ * The rewrite runs on a scanner that consumes whole string literals first, so
+ * message *content* that happens to contain `"msg_id": 123…` is left alone —
+ * a plain global replace used to rewrite the user's own text before it reached
+ * the model.
+ */
 export function parseWireJson<T>(raw: string): T {
   const alternation = LOSSLESS_ID_FIELDS.join("|")
-  const rewritten = raw.replace(new RegExp(`"(${alternation})"\\s*:\\s*(\\d{6,})`, "g"), '"$1":"$2"')
+  // Order matters: the key/value pair is tried first, and only when it does not
+  // match is a whole string literal consumed. That way a message whose *text*
+  // contains `"msg_id": 123…` is read as one opaque string and left untouched.
+  const scanner = new RegExp(`"(${alternation})"\\s*:\\s*(\\d{6,})|"(?:[^"\\\\]|\\\\.)*"`, "g")
+  const rewritten = raw.replace(scanner, (match: string, key?: string, digits?: string) =>
+    key === undefined ? match : `"${key}":"${digits}"`,
+  )
   return JSON.parse(rewritten) as T
 }
 
@@ -247,6 +369,10 @@ export interface ApiRequest {
 export async function apiCallRaw(request: ApiRequest): Promise<string> {
   const base = request.baseUrl.endsWith("/") ? request.baseUrl : `${request.baseUrl}/`
   const url = new URL(request.endpoint, base)
+  // The base URL comes from a QR-status answer, i.e. from the network. Validate
+  // it on every call (and refuse redirects below) so a hijacked answer cannot
+  // walk off with the bearer token.
+  assertTrustedUrl(url.toString(), `iLink 请求 ${request.endpoint}`)
   const timeout = request.timeoutMs ?? DEFAULT_API_TIMEOUT_MS
 
   const controller = new AbortController()
@@ -258,10 +384,21 @@ export async function apiCallRaw(request: ApiRequest): Promise<string> {
       method: request.method ?? "POST",
       headers: buildHeaders(request.token),
       ...(request.body === undefined ? {} : { body: JSON.stringify(request.body) }),
+      redirect: "error",
       signal,
     })
-    const text = await response.text()
+    const text = await readBoundedText(response, MAX_API_BODY_BYTES)
     if (!response.ok) throw new ApiHttpError(request.endpoint, response.status, text)
+    // A captive portal answers 200 with an HTML page. Say what happened instead
+    // of letting JSON.parse fail with "Unexpected token '<'" and masking the
+    // real cause behind a syntax error nobody can act on.
+    const type = (response.headers.get("content-type") ?? "").toLowerCase()
+    const looksJson = !type || type.includes("json") || type.includes("text/plain")
+    if (text.trim() && !looksJson) {
+      throw new Error(
+        `${request.endpoint} 返回的不是 JSON（content-type: ${type}）——校园网/酒店门户会这样，先完成认证再重试`,
+      )
+    }
     return text
   } finally {
     clearTimeout(timer)
@@ -284,9 +421,11 @@ export async function apiCallVoid(request: ApiRequest): Promise<void> {
   const raw = await apiCallRaw(request)
   if (!raw.trim()) return
   const response = parseWireJson<{ ret?: number; errcode?: number; errmsg?: string }>(raw)
-  const code = response.errcode ?? response.ret
+  const code = toCode(response.errcode ?? response.ret)
   if (code !== undefined && code !== 0) {
-    throw new Error(`${request.endpoint} 失败 ret=${response.ret} errcode=${response.errcode} errmsg=${response.errmsg ?? ""}`)
+    throw new Error(
+      `${request.endpoint} 失败 ret=${response.ret} errcode=${response.errcode} errmsg=${redactSecrets(String(response.errmsg ?? ""))}`,
+    )
   }
 }
 
@@ -525,8 +664,15 @@ export async function login(options: LoginOptions = {}): Promise<LoginResult> {
 
       case "scaned_but_redirect": {
         if (status.redirect_host) {
-          emit({ kind: "redirected", host: status.redirect_host })
-          baseUrl = `https://${status.redirect_host}`
+          // Verified before use: this is the network telling the bot where to
+          // send its token next.
+          if (isTrustedUrl(`https://${status.redirect_host}`)) {
+            emit({ kind: "redirected", host: status.redirect_host })
+            baseUrl = `https://${status.redirect_host}`
+          } else {
+            emit({ kind: "failed", reason: `服务端要求切换到非腾讯域名，已拒绝：${status.redirect_host}` })
+            return { alreadyBound: false, reason: `拒绝切换到 ${status.redirect_host}` }
+          }
         }
         break
       }
@@ -568,10 +714,15 @@ function accountFromStatus(status: QRStatusResponse, fallbackBaseUrl: string): W
   const token = status.bot_token?.trim()
   if (!token) return undefined
   const now = new Date().toISOString()
+  // The answer carries a base URL, i.e. the network chooses where the token
+  // will be sent from now on: only a trusted WeChat host (or the known-good
+  // fallback) is adopted, so a hijacked answer cannot point the bot elsewhere.
+  const offered = status.baseurl?.trim()
+  const baseUrl = offered && isTrustedUrl(offered) ? offered : fallbackBaseUrl
   return {
     accountId: status.ilink_bot_id,
     token,
-    baseUrl: status.baseurl?.trim() || fallbackBaseUrl,
+    baseUrl,
     ...(status.ilink_user_id === undefined ? {} : { userId: status.ilink_user_id }),
     savedAt: now,
     boundAt: now,
@@ -591,12 +742,13 @@ function accountFromStatus(status: QRStatusResponse, fallbackBaseUrl: string): W
  * endpoint has been seen with either.
  */
 export function assertSendAccepted(response: SendMessageResp): void {
-  const code = response.errcode ?? response.ret
+  const code = toCode(response.errcode ?? response.ret)
   if (code === undefined || code === 0) return
+  const reason = redactSecrets(String(response.errmsg ?? ""))
   if (code === STALE_TOKEN_ERRCODE) {
     throw new SendRefusedError("微信会话已超时，需要你先在微信里发一条消息再主动推送", code)
   }
-  throw new SendRefusedError(`发送被微信拒绝：errcode=${String(code)} errmsg=${response.errmsg ?? "(无)"}`, code)
+  throw new SendRefusedError(`发送被微信拒绝：errcode=${String(code)} errmsg=${reason || "(无)"}`, code)
 }
 
 /**
@@ -614,6 +766,14 @@ export interface SendTextParams {
   contextToken?: string
   runId?: string
   signal?: AbortSignal
+  /**
+   * Reuse a client id (idempotency).
+   *
+   * The service dedupes on `client_id`, so a retry of the *same* logical
+   * message must send the same id — otherwise an ambiguous timeout (the answer
+   * was lost, the message was accepted) delivers the text twice.
+   */
+  clientId?: string
 }
 
 /** Send one text message. Throws `SendRefusedError` when the service refuses it. */
@@ -624,7 +784,7 @@ export async function sendText(params: SendTextParams): Promise<{ clientId: stri
   if (text.length > MAX_TEXT_CHARS) {
     throw new Error(`单条消息 ${text.length} 字符，超过服务端上限 ${MAX_TEXT_CHARS}`)
   }
-  const clientId = newClientId()
+  const clientId = params.clientId?.trim() || newClientId()
   const response = await apiCall<SendMessageResp>({
     baseUrl: params.account.baseUrl,
     endpoint: "ilink/bot/sendmessage",
@@ -673,9 +833,11 @@ export async function getTypingTicket(params: {
   })
   // A refusal used to be invisible here: the caller just got "no ticket" and the
   // indicator stayed off forever without a single log line.
-  const code = response.errcode ?? response.ret
+  const code = toCode(response.errcode ?? response.ret)
   if (code !== undefined && code !== 0) {
-    throw new Error(`getconfig 失败 ret=${response.ret} errcode=${response.errcode} errmsg=${response.errmsg ?? ""}`)
+    throw new Error(
+      `getconfig 失败 ret=${response.ret} errcode=${response.errcode} errmsg=${redactSecrets(String(response.errmsg ?? ""))}`,
+    )
   }
   return response.typing_ticket
 }
@@ -773,12 +935,17 @@ export async function getUploadUrl(params: {
     timeoutMs: 20_000,
     signal: params.signal,
   })
-  const code = response.errcode ?? response.ret
+  const code = toCode(response.errcode ?? response.ret)
   if (code !== undefined && code !== 0) {
     throw new SendRefusedError(
-      `获取上传参数被拒：errcode=${String(code)} errmsg=${response.errmsg ?? "(无)"}`,
+      `获取上传参数被拒：errcode=${String(code)} errmsg=${redactSecrets(String(response.errmsg ?? "")) || "(无)"}`,
       code,
     )
+  }
+  // The upload URL comes from the network and the file is POSTed to it: a
+  // hostile answer must not be able to redirect the content elsewhere.
+  if (response.upload_full_url && !isTrustedUrl(response.upload_full_url)) {
+    response.upload_full_url = undefined
   }
   return response
 }

@@ -14,8 +14,9 @@
  */
 
 import { basename, isAbsolute, join, resolve as resolvePath } from "node:path"
+import { homedir } from "node:os"
 import { pathToFileURL } from "node:url"
-import { promises as fs, readFileSync } from "node:fs"
+import { promises as fs, readFileSync, statSync } from "node:fs"
 
 import type * as OpenCodePlugin from "@opencode/plugin"
 
@@ -28,15 +29,17 @@ import {
   SendRefusedError,
   notifyStart,
   notifyStop,
+  newClientId,
   sendItems,
   sendText,
   getTypingTicket,
   sendTyping,
   textItem,
+  redactSecrets,
   type WeixinAccount,
 } from "./ilink.ts"
 import { ChannelMonitor, conversationKey, type InboundMessage } from "./monitor.ts"
-import { downloadItem, prepareAttachment, kindForPath, type OutboundKind } from "./media.ts"
+import { downloadItem, prepareAttachment, kindForPath, pruneInbox, type OutboundKind } from "./media.ts"
 import {
   DECISION_LABEL,
   MAX_PENDING_PERMISSIONS,
@@ -67,11 +70,15 @@ import {
 import {
   acquireLock,
   lockOwnerInstanceId,
+  pruneQrPng,
+  pruneStaleTemps,
   readState,
   updateState,
   STATE_DIR,
+  STATE_PATH,
   SEEN_MESSAGE_LIMIT,
   type LockHandle,
+  type QueuedMessage,
   type SessionBinding,
   type State,
 } from "./state.ts"
@@ -98,6 +105,14 @@ const POLL_RESTART_COOLDOWN_MS = 5 * 60_000
 const SUSPENSION_GAP_MS = 60_000
 /** How many queued messages one conversation keeps before the oldest are dropped. */
 const QUEUE_LIMIT = 20
+/** First characters of the "part of the answer is missing" notice. */
+const NOTICE_PREFIX = "⚠️ 上面那条没发完"
+/** Hourly retention/expiry chores, run from the ownership tick. */
+const HOUSEKEEPING_INTERVAL_MS = 60 * 60_000
+/** A parked queue nobody claimed for this long is dropped (it is stale content). */
+const PARKED_QUEUE_TTL_MS = 7 * 24 * 60 * 60_000
+/** The "typing…" refresh stops itself after this long, whatever happens. */
+const TYPING_MAX_MS = 10 * 60_000
 /**
  * How recently a flush must have delivered something for `/more` to treat the
  * answer as "already recovered" instead of asking the model to continue.
@@ -144,7 +159,7 @@ interface LiveBuffer {
 }
 
 /** A question the agent asked and is blocked on. */
-const QUESTION_POLL_MS = 1_000
+const QUESTION_POLL_MS = 3_000
 
 export class Bridge {
   readonly #ctx: Context
@@ -157,6 +172,14 @@ export class Bridge {
   #monitor?: ChannelMonitor
   #lock?: LockHandle
   #maintenance?: NodeJS.Timeout
+  /** One in-flight auto-follow at a time: a slow API used to overlap them. */
+  #following = false
+  /** One in-flight reconcile at a time, for the same reason. */
+  #reconciling = false
+  /** When the hourly chores last ran. */
+  #lastHousekeeping = 0
+  /** `mtimeMs:size` of the state file at the last (successful) reload. */
+  #stateStamp?: string
 
   #typingTickets = new Map<string, string | undefined>()
   #typingTimers = new Map<string, NodeJS.Timeout>()
@@ -171,6 +194,16 @@ export class Bridge {
   #typingSessions = new Map<string, string>()
   #turns = new Map<string, TurnBuffer>()
   #live = new Map<string, LiveBuffer>()
+  /**
+   * Sessions whose current turn has already been signalled as finished.
+   *
+   * A completion signal can arrive before the last text block, so from that
+   * point on the turn uses the short settle window instead of the full grace —
+   * and a new turn (busy/started) clears the flag again.
+   */
+  #settledTurns = new Set<string>()
+  /** Event types seen once, so a renamed host event is visible in the log. */
+  #seenEventTypes = new Set<string>()
   #pendingPermissions: PendingPermission[] = []
   #pendingForms: PendingForm[] = []
   #lastReconcile = 0
@@ -234,6 +267,18 @@ export class Bridge {
   }
 
   reloadState(): void {
+    // mtime-gated: the ownership tick calls this every 10 s (per loaded project)
+    // and every inbound message does too, so parsing an unchanged 13 KB JSON file
+    // was pure waste. `statSync` is about two orders of magnitude cheaper.
+    try {
+      const stats = statSync(STATE_PATH)
+      const stamp = `${stats.mtimeMs}:${stats.size}`
+      if (this.#stateStamp === stamp) return
+      this.#stateStamp = stamp
+    } catch {
+      // Missing/unreadable file: fall through and let readState decide.
+      this.#stateStamp = undefined
+    }
     this.#state = readState()
     // Adopt the conversation's session as the home channel when an install
     // predates the channel concept — without this, the first `/detach` would
@@ -280,7 +325,7 @@ export class Bridge {
       this.#maintenance.unref?.()
     }
 
-    if (this.#lock.info.instanceId !== lockOwnerInstanceId()) {
+    if (this.#lock && !this.#lock.isMine()) {
       this.#log.warn(`poller ownership lost; stopping (mine=${this.#lock.info.instanceId.slice(0, 8)})`)
       this.releaseOwnership()
       return false
@@ -298,7 +343,7 @@ export class Bridge {
     try {
       this.reloadState()
       this.#lock?.refresh()
-      if (this.#lock && this.#lock.info.instanceId !== lockOwnerInstanceId()) {
+      if (this.#lock && !this.#lock.isMine()) {
         this.#log.warn("lock no longer names this instance; stopping the poller")
         this.releaseOwnership()
         return
@@ -337,14 +382,114 @@ export class Bridge {
       }
       // Anything the agent is waiting on while this instance restarted must be
       // picked back up, or the question would sit unanswered on the server.
-      if (Date.now() - this.#lastReconcile > RECONCILE_INTERVAL_MS) {
-        void this.reconcilePending().catch((error) => this.#log.warn(`reconcile failed: ${errorText(error)}`))
+      if (Date.now() - this.#lastReconcile > RECONCILE_INTERVAL_MS && !this.#reconciling) {
+        this.#reconciling = true
+        void this.reconcilePending()
+          .catch((error) => this.#log.warn(`reconcile failed: ${errorText(error)}`))
+          .finally(() => {
+            this.#reconciling = false
+          })
       }
       // Keep the conversation on whatever the desktop is working on.
-      void this.followActiveSession().catch((error) => this.#log.warn(`auto-follow failed: ${errorText(error)}`))
+      if (!this.#following) {
+        this.#following = true
+        void this.followActiveSession()
+          .catch((error) => this.#log.warn(`auto-follow failed: ${errorText(error)}`))
+          .finally(() => {
+            this.#following = false
+          })
+      }
+      // Hourly chores. They used to run only as side effects of other work, so
+      // an idle channel never pruned its inbox, its stale temp files or its
+      // expired question records.
+      if (Date.now() - this.#lastHousekeeping > HOUSEKEEPING_INTERVAL_MS) {
+        this.#lastHousekeeping = Date.now()
+        try {
+          this.#housekeeping()
+        } catch (error) {
+          this.#log.warn(`housekeeping failed: ${errorText(error)}`)
+        }
+      }
     } catch (error) {
       this.#log.warn(`ownership check failed: ${errorText(error)}`)
     }
+  }
+
+  /** The hourly chores: retention, expiry, and per-conversation bookkeeping. */
+  #housekeeping(): void {
+    try {
+      pruneInbox()
+    } catch (error) {
+      this.#log.warn(`inbox prune failed: ${errorText(error)}`)
+    }
+    try {
+      pruneStaleTemps()
+    } catch (error) {
+      this.#log.warn(`temp prune failed: ${errorText(error)}`)
+    }
+    // A QR bitmap left behind by an abandoned login is a scannable credential.
+    if (pruneQrPng()) this.#log.info("removed a stale login QR image")
+    // A channel that goes quiet used to keep expired question records forever:
+    // the sweep only ran from `handleInbound`.
+    this.#sweepStaleQuestions()
+    this.#expireParkedQueues()
+    this.#pruneConversationState()
+  }
+
+  /**
+   * Drop parked queues that nobody ever fetched.
+   *
+   * After the backoff runs out the text waits for the next inbound message; if
+   * the user never comes back it would sit in the state file forever (up to
+   * `QUEUE_LIMIT × chunkSize` per conversation).
+   */
+  #expireParkedQueues(): void {
+    const now = Date.now()
+    for (const [conversationId, items] of Object.entries(this.#state.pendingOutbound ?? {})) {
+      if (items.length === 0) continue
+      const since = this.#state.pendingOutboundSince?.[conversationId]
+      if (since === undefined || now - since < PARKED_QUEUE_TTL_MS) continue
+      const backoff = this.#config.retryBackoffMs
+      if (this.#retryAttempt(conversationId) < Math.max(backoff.length, 1)) continue
+      this.#log.warn(
+        `dropping ${items.length} parked message(s) for ${conversationId}: unclaimed for ${Math.round(
+          (now - since) / 86_400_000,
+        )} day(s)`,
+      )
+      this.#dropQueue(conversationId)
+    }
+  }
+
+  /**
+   * Forget per-conversation bookkeeping for conversations that no longer exist.
+   *
+   * These maps are keyed by "conversations that ever existed", so a deleted
+   * session or a `/switch` left an entry behind for the life of the process.
+   */
+  #pruneConversationState(): void {
+    const live = new Set(Object.keys(this.#state.bindings))
+    if (this.#state.lastConversation) live.add(this.#state.lastConversation)
+    const maps: Array<Map<string, unknown>> = [
+      this.#typingTickets,
+      this.#typingTimers,
+      this.#typingSessions,
+      this.#sendChains,
+      this.#lastListing,
+      this.#lastFlushedAt,
+      this.#queueGenerations,
+    ]
+    for (const map of maps) {
+      for (const key of [...map.keys()]) {
+        if (!live.has(key)) map.delete(key)
+      }
+    }
+    for (const sessionID of [...this.#settledTurns]) {
+      if (!live.has(sessionID)) this.#settledTurns.delete(sessionID)
+    }
+    // Approval/form records belong to a session; a conversation that is gone
+    // cannot answer them.
+    this.#pendingPermissions = this.#pendingPermissions.filter((item) => live.has(item.conversationId))
+    this.#pendingForms = this.#pendingForms.filter((item) => live.has(item.conversationId))
   }
 
   /**
@@ -411,6 +556,20 @@ export class Bridge {
         `（这条审批还在等你回复）\n${formatPermissionPrompt(pending, queue.indexOf(pending) + 1, queue.length)}`,
       )
     }
+
+    // Reap approvals whose session no longer exists. They cannot be answered —
+    // `permission.reply` fails — and they keep occupying an index, so a genuine
+    // new approval behind them looked unanswerable.
+    for (const item of [...this.#pendingPermissions]) {
+      const session = await this.#ctx.session.get({ sessionID: item.sessionID }).catch(() => undefined)
+      if (session) continue
+      this.#pendingPermissions = this.#pendingPermissions.filter((entry) => entry !== item)
+      this.#log.info(`dropped approval ${item.requestID}: its session no longer exists`)
+      await this.#send(
+        item.conversationId,
+        `ℹ️ 有一个待审批（${describeAction(item.action)}）的会话已经被删掉了，已从列表移除。`,
+      )
+    }
   }
 
   releaseOwnership(): void {
@@ -453,9 +612,13 @@ export class Bridge {
       account,
       initialSyncBuf: this.#state.syncBuf,
       onSyncBuf: (buf) => {
+        // Only write when the cursor actually moved: the poll answer repeats the
+        // same cursor often, and each write rewrites the whole state file.
+        if (this.#state.syncBuf === buf) return
         this.#state = updateState((state) => {
           state.syncBuf = buf
         })
+        this.#stateStamp = undefined
       },
       onMessage: (message) => this.handleInbound(message),
       onError: (error) => this.#log.warn(`poll: ${errorText(error)}`),
@@ -650,6 +813,8 @@ export class Bridge {
         notes.push(
           `[收到${kindHint} ${result.media.name}（${result.media.bytes} 字节），已保存为本地文件：${result.media.path}]`,
         )
+        // A size mismatch means the body may have been truncated in transit.
+        if (result.note) notes.push(`[${result.note}]`)
       } else if (result.note) {
         notes.push(`[${result.note}]`)
       }
@@ -668,11 +833,12 @@ export class Bridge {
 
     this.#log.info(`inbound ${conversationId}: ${text.slice(0, 120).replace(/\n/g, " ")}`)
 
-    if (await this.#maybeHandlePermissionReply(conversationId, text)) return
-    if (text.startsWith("/") && (await this.#handleCommand(conversationId, text))) return
+    // Commands first (the user is explicit), then a pending `wechat_ask`
+    // question, and only then a bare approval shortcut: with an approval
+    // pending, answering a question with "可以" used to approve a shell command
+    // *and* leave the question blocking until timeout.
+    if (looksLikeCommand(text) && (await this.#handleCommand(conversationId, text))) return
 
-    // A question from `wechat_ask` consumes the next ordinary message: the agent
-    // is blocked on it, so anything else would be answered out of order.
     // A question from `wechat_ask` consumes the next ordinary message: the agent
     // is blocked on it. Both sides of that exchange live in shared state, because
     // the instance running the tool is not necessarily the instance reading the
@@ -688,6 +854,8 @@ export class Bridge {
       this.#log.info(`question answered: ${text.slice(0, 80)}`)
       return
     }
+
+    if (await this.#maybeHandlePermissionReply(conversationId, text)) return
 
     await this.#dispatch(conversationId, text, attachments, titleHint)
   }
@@ -1040,6 +1208,26 @@ export class Bridge {
     return isAbsolute(configured) ? configured : resolvePath(configured)
   }
 
+  /**
+   * Interpret a user-typed path (`/new`, `/dir`).
+   *
+   * Quotes are stripped because Windows users paste `"D:\code\repo"`, `~`
+   * expands to the home directory, and a relative path resolves against the
+   * *current session's* directory — resolving it against the plugin process's
+   * cwd was silently unpredictable from the phone. The caller always echoes the
+   * resolved path back.
+   */
+  #resolveUserPath(argument: string, conversationId: string): string {
+    const unquoted = stripQuotes(argument)
+    if (unquoted === "~") return resolvePath(homedir())
+    if (unquoted.startsWith("~") && /^[\\/]/.test(unquoted.slice(1))) {
+      return resolvePath(join(homedir(), unquoted.slice(2)))
+    }
+    if (isAbsolute(unquoted)) return resolvePath(unquoted)
+    const base = this.#state.bindings[conversationId]?.directory ?? this.#defaultDirectory()
+    return resolvePath(join(base, unquoted))
+  }
+
   #alreadyHandled(messageId: string): boolean {
     return (this.#state.seenMessages ?? []).includes(messageId)
   }
@@ -1056,8 +1244,12 @@ export class Bridge {
 
   /** @returns true when the text was a command and has been handled. */
   async #handleCommand(conversationId: string, text: string): Promise<boolean> {
+    // The command word is NFKC-normalised: Chinese IMEs emit full-width input
+    // (`／列表`, `／attach ２`) and a command that silently does nothing is worse
+    // than one that explains itself. Arguments stay untouched so a path or title
+    // keeps whatever the user typed.
     const [rawCommand, ...rest] = text.split(/\s+/)
-    const command = rawCommand.toLowerCase().replace(/[:：]$/, "")
+    const command = (rawCommand ?? "").normalize("NFKC").toLowerCase().replace(/[:：]$/, "")
     const argument = rest.join(" ").trim()
 
     switch (command) {
@@ -1206,13 +1398,13 @@ export class Bridge {
     let title: string | undefined
 
     if (argument) {
-      const candidate = isAbsolute(argument) ? argument : resolvePath(argument)
+      const candidate = this.#resolveUserPath(argument, conversationId)
       const stats = await fs.stat(candidate).catch(() => undefined)
       if (stats?.isDirectory()) {
         directory = candidate
         title = basename(candidate)
       } else {
-        title = argument
+        title = stripQuotes(argument)
       }
     }
 
@@ -1260,10 +1452,25 @@ export class Bridge {
     // "/list [页码]" pages the phone's own list; "/list all [页码]" everything
     // else. Indices are global (page 2 starts at 16), so `/attach 42` works no
     // matter which page the number came from.
-    const raw = argument.trim()
-    const wantOthers = /^all\b/i.test(raw)
-    const requested = Number.parseInt(raw.replace(/^all\b/i, "").trim(), 10)
-    const page = Number.isFinite(requested) && requested > 0 ? requested : 1
+    const raw = normalizeArgument(argument)
+    const tokens = raw.toLowerCase().split(/\s+/).filter(Boolean)
+    const wantOthers = tokens.includes("all")
+    const numericTokens = tokens.filter((token) => token !== "all")
+    // Two page numbers ("/list 2 all 3") are ambiguous, and junk is junk: say so
+    // rather than silently picking one.
+    const invalid = numericTokens.find((token) => !/^\d+$/.test(token))
+    if (numericTokens.length > 1 || invalid !== undefined) {
+      await this.#send(
+        conversationId,
+        invalid !== undefined
+          ? `用法：/list [all] [页码] —— 看不懂「${invalid}」`
+          : `页码只能给一个：/list [all] [页码]`,
+      )
+      return
+    }
+    const pageToken = numericTokens[0]
+    const requested = pageToken === undefined ? 1 : Number.parseInt(pageToken, 10)
+    const page = requested > 0 ? requested : 1
     const channel = channelID ? sessions.find((session) => session.id === channelID) : undefined
 
     if (wantOthers) {
@@ -1345,16 +1552,19 @@ export class Bridge {
 
   /** Resolve a list index against what was last shown, then the full list. */
   async #resolveIndexed(argument: string): Promise<ApiSession | undefined> {
+    // NFKC first: `Number.parseInt("３")` is NaN, so a full-width index used to
+    // fall through to a lookup that could not match either.
+    const value = normalizeArgument(argument)
     const { sessions } = await this.#collectSessions()
     const conversationId = this.#state.lastConversation ?? ""
     const remembered = this.#lastListing.get(conversationId)
-    const index = Number.parseInt(argument, 10)
-    if (Number.isFinite(index) && String(index) === argument.trim() && remembered) {
+    const index = Number.parseInt(value, 10)
+    if (Number.isFinite(index) && String(index) === value && remembered) {
       const id = remembered[index - 1]
       const found = id ? sessions.find((session) => session.id === id) : undefined
       if (found) return found
     }
-    return resolveSessionTarget(sessions, argument)
+    return resolveSessionTarget(sessions, value)
   }
 
   async #switchSession(conversationId: string, argument: string): Promise<void> {
@@ -1459,13 +1669,26 @@ export class Bridge {
    */
   async #attachSession(conversationId: string, argument: string): Promise<void> {
     if (argument) {
-      const target = await this.#resolveIndexed(argument)
+      let target = await this.#resolveIndexed(argument)
+      if (!target) {
+        // A pasted id may be older than the fetched list (or the local API may be
+        // down); `/switch` already accepts that, so `/attach` must too — the two
+        // are documented as the same operation with different bookkeeping.
+        const byId = (await this.#ctx.session.get({ sessionID: argument.trim() }).catch(() => undefined)) as
+          | { id: string; title?: string; location?: { directory?: string } }
+          | undefined
+        if (byId) {
+          target = { id: byId.id, title: byId.title, location: byId.location, time: { updated: Date.now() } }
+        }
+      }
       if (!target) {
         await this.#send(conversationId, `没找到匹配的会话：${argument}`)
         return
       }
-      // Same path as the desktop button, so both surfaces record the same thing.
-      await this.lendSession(target.id)
+      // Same path as the desktop button, so both surfaces record the same thing
+      // (phone list, 📱 marker, follow hold).
+      const result = await this.lendSession(target.id)
+      if (!result.ok) await this.#send(conversationId, `没接上：${result.message ?? "未知原因"}`)
       return
     }
 
@@ -1475,8 +1698,13 @@ export class Bridge {
       return
     }
 
+    // Same bookkeeping as `lendSession` (phone list, 📱 marker, explicit hold):
+    // without it the borrowed session was missing from /list and never got the
+    // marker, because only the argument path called lendSession.
     const running = (await this.#api.listActiveSessions()).includes(target.id)
     this.#bind(conversationId, target, { explicit: true })
+    this.#rememberPhoneSession(target.id)
+    await this.#markPhoneUsage(target.id, true)
     await this.#send(
       conversationId,
       [
@@ -1511,6 +1739,22 @@ export class Bridge {
     if (binding.switchedAt && now - binding.switchedAt < this.#config.followHoldMs) return
     if ((this.#followed.get(conversationId) ?? 0) > now - this.#config.followHoldMs) return
 
+    // Never move the phone while an answer is in flight or something waits on it.
+    // Re-binding makes the old session's events unresolvable, so its
+    // `session.text.ended` was dropped (the answer never arrived) and its
+    // approval never reached the phone at all.
+    const current = binding.sessionID
+    if (
+      this.#turns.has(current) ||
+      this.#live.has(current) ||
+      this.#typingSessions.has(current) ||
+      this.#pendingPermissions.some((item) => item.conversationId === conversationId) ||
+      this.#pendingForms.some((item) => item.conversationId === conversationId)
+    ) {
+      return
+    }
+    if (this.#state.pendingQuestions?.[conversationId]) return
+
     const candidate = await this.#pickActiveSession({ exclude: binding.sessionID, runningOnly: true })
     if (!candidate) return
 
@@ -1539,9 +1783,15 @@ export class Bridge {
       await this.#send(conversationId, `已经在主会话上了：${channel.title ?? "主会话"}`)
       return
     }
-    // Leaving a session also clears its phone marker.
+    // Leaving a session also clears its phone marker — and it counts as a manual
+    // move, so auto-follow does not re-attach within the hold window (otherwise
+    // /detach looked broken: the next 10 s tick put the phone straight back).
     if (binding?.sessionID) await this.#markPhoneUsage(binding.sessionID, false)
     this.#bind(conversationId, { id: channel.id, title: channel.title, location: channel.location })
+    this.#state = updateState((state) => {
+      const current = state.bindings[conversationId]
+      if (current) state.bindings[conversationId] = { ...current, switchedAt: Date.now() }
+    })
     this.#rememberPhoneSession(channel.id)
     await this.#send(
       conversationId,
@@ -1671,7 +1921,8 @@ export class Bridge {
   /** Show or clear whatever is waiting to be sent to this conversation. */
   async #handleQueue(conversationId: string, argument: string): Promise<void> {
     const queued = this.#queueFor(conversationId)
-    if (argument === "clear") {
+    const head = normalizeArgument(argument).toLowerCase().split(/\s+/)[0]
+    if (head === "clear") {
       const dropped = this.#dropQueue(conversationId)
       await this.#send(conversationId, dropped > 0 ? `🗑 已丢弃 ${dropped} 条待发消息。` : "没有待发消息。")
       return
@@ -1684,7 +1935,7 @@ export class Bridge {
       conversationId,
       [
         `📮 有 ${queued.length} 条等你说话后补发：`,
-        ...queued.slice(0, 5).map((text, index) => `${index + 1}. ${text.replace(/\s+/g, " ").slice(0, 80)}`),
+        ...queued.slice(0, 5).map((item, index) => `${index + 1}. ${item.text.replace(/\s+/g, " ").slice(0, 80)}`),
         "",
         "用 /more 立刻补发（/retry 同效），/queue clear 丢弃。",
       ].join("\n"),
@@ -1714,18 +1965,27 @@ export class Bridge {
       return
     }
     try {
-      await this.#ctx.session.update({ sessionID: binding.sessionID, title: argument })
+      // A *lent* session (one carrying the 📱 marker) keeps it: renaming used to
+      // strip it, and the desktop then could not tell the phone was still using
+      // the session. A session the phone created itself gets no marker.
+      const existing = (await this.#ctx.session.get({ sessionID: binding.sessionID }).catch(() => undefined)) as
+        | { title?: string }
+        | undefined
+      const wasMarked = (existing?.title ?? binding.title ?? "").startsWith("📱 ")
+      const title = wasMarked && !argument.startsWith("📱 ") ? `📱 ${argument}` : argument
+      await this.#ctx.session.update({ sessionID: binding.sessionID, title })
       this.#state = updateState((state) => {
         const current = state.bindings[conversationId]
-        if (current) state.bindings[conversationId] = { ...current, title: argument }
+        if (current) state.bindings[conversationId] = { ...current, title }
       })
-      await this.#send(conversationId, `✅ 已重命名为「${argument}」`)
+      await this.#send(conversationId, `✅ 已重命名为「${title}」`)
     } catch (error) {
       await this.#send(conversationId, `❌ 重命名失败：${errorText(error)}`)
     }
   }
 
   async #cancel(conversationId: string, argument: string): Promise<void> {
+    const wantsQueueDrop = normalizeArgument(argument).toLowerCase().split(/\s+/).includes("all")
     const binding = this.#state.bindings[conversationId]
     if (!binding) {
       await this.#send(conversationId, "当前没有会话。")
@@ -1747,7 +2007,7 @@ export class Bridge {
       const turn = this.#turns.get(binding.sessionID)
       if (turn?.timer) clearTimeout(turn.timer)
       this.#turns.delete(binding.sessionID)
-      const dropped = argument === "all" ? this.#dropQueue(conversationId) : 0
+      const dropped = wantsQueueDrop ? this.#dropQueue(conversationId) : 0
       await this.#send(
         conversationId,
         dropped > 0 ? `⏹ 已请求中断，并丢弃了 ${dropped} 条待发消息。` : "⏹ 已请求中断当前任务。",
@@ -1883,7 +2143,7 @@ export class Bridge {
       )
       return
     }
-    const candidate = isAbsolute(argument) ? argument : resolvePath(argument)
+    const candidate = this.#resolveUserPath(argument, conversationId)
     const stats = await fs.stat(candidate).catch(() => undefined)
     if (!stats?.isDirectory()) {
       await this.#send(conversationId, `目录不存在：${candidate}`)
@@ -2078,6 +2338,13 @@ export class Bridge {
       createdAt: Date.now(),
       announced: false,
     }
+    // The same request can be delivered twice (a redelivery, a re-subscribed
+    // event stream). Two entries meant two announcements, a bare "1" settling
+    // only one of them, and `/allow` failing on the twin.
+    if (this.#pendingPermissions.some((item) => item.requestID === request.requestID)) {
+      this.#log.info(`ignored a duplicate permission.asked for ${request.requestID}`)
+      return
+    }
     this.#pendingPermissions.push(request)
     while (this.#pendingPermissions.length > MAX_PENDING_PERMISSIONS) {
       const dropped = this.#pendingPermissions.shift()
@@ -2136,14 +2403,35 @@ export class Bridge {
    * -------------------------------------------------------------------------
    */
 
-  async #answerForm(conversationId: string, argument: string): Promise<void> {
+  async #answerForm(conversationId: string, rawArgument: string): Promise<void> {
     const pending = this.#pendingForms.filter((item) => item.conversationId === conversationId)
     if (pending.length === 0) {
       await this.#send(conversationId, "当前没有待回答的问题。")
       return
     }
 
-    const form = pending[0]
+    // `/answer #2 是` targets the second pending form. Without a selector the
+    // first one is used, which used to make a second form answerable only after
+    // the first was dealt with — and silently validated against the wrong fields.
+    let argument = rawArgument.trim()
+    let index = 0
+    const selector = /^#(\d+)\s*(.*)$/s.exec(argument)
+    if (selector) {
+      index = Number.parseInt(selector[1] ?? "1", 10) - 1
+      argument = (selector[2] ?? "").trim()
+      if (index < 0 || index >= pending.length) {
+        await this.#send(conversationId, `只有 ${pending.length} 个待回答的问题（用 /answer #1 … #${pending.length}）。`)
+        return
+      }
+    }
+    const form = pending[index]!
+    if (!argument) {
+      await this.#send(
+        conversationId,
+        `用法：/answer 答案${pending.length > 1 ? `（或 /answer #1 … #${pending.length} 指定第几个）` : ""}`,
+      )
+      return
+    }
     const resolved = resolveAnswer(form, argument)
     if ("error" in resolved) {
       await this.#send(conversationId, `⚠️ ${resolved.error}`)
@@ -2212,6 +2500,13 @@ export class Bridge {
   async handleEvent(event: { type?: string; data?: unknown }): Promise<void> {
     const type = event.type
     if (!type) return
+    // Log every event type once per process. When the host renames something
+    // (as it did for the turn's end signal — `session.idle` never arrived in
+    // 2.0.2x) this line is what makes it visible instead of silent.
+    if (!this.#seenEventTypes.has(type)) {
+      this.#seenEventTypes.add(type)
+      this.#log.info(`event type seen for the first time: ${type}`)
+    }
     const data = (event.data ?? {}) as Record<string, unknown>
     const sessionID = typeof data.sessionID === "string" ? data.sessionID : undefined
 
@@ -2262,8 +2557,47 @@ export class Bridge {
         return
       }
 
-      case "session.idle": {
-        if (sessionID) await this.#finishTurn(sessionID, "idle")
+      case "session.text.started":
+      case "session.execution.started": {
+        // A new turn began: the settle shortcut belongs to the previous one.
+        if (sessionID) this.#settledTurns.delete(sessionID)
+        return
+      }
+
+      case "session.idle":
+      case "session.execution.succeeded": {
+        // Both mean "the turn is over". `session.execution.succeeded` is the
+        // durable one and does arrive; `session.idle` is kept as a fallback.
+        if (sessionID) await this.#finishTurnSoon(sessionID)
+        return
+      }
+
+      case "session.status": {
+        if (!sessionID) return
+        const status = (data.status ?? {}) as { type?: string; attempt?: number; message?: string } | string
+        const kind = typeof status === "string" ? status : status.type
+        if (kind === "idle") {
+          await this.#finishTurnSoon(sessionID)
+          return
+        }
+        if (kind === "busy") {
+          this.#settledTurns.delete(sessionID)
+          return
+        }
+        if (kind === "retry") {
+          const attempt = typeof status === "object" && typeof status.attempt === "number" ? status.attempt : 0
+          const reason = typeof status === "object" ? String(status.message ?? "").slice(0, 80) : ""
+          this.#log.info(`provider retry for ${sessionID.slice(0, 16)}: attempt ${attempt}${reason ? ` (${reason})` : ""}`)
+          // A silent multi-minute retry loop looks like a hang from the phone;
+          // nudge twice and let the normal progress setting keep it quiet.
+          if ((attempt === 2 || attempt === 5) && this.#config.progress !== "off") {
+            const conversationId = this.#conversationForSession(sessionID)
+            if (conversationId) {
+              await this.#sendEphemeral(conversationId, `⚠️ 模型请求失败，正在第 ${attempt} 次重试${reason ? `：${reason}` : ""}`)
+            }
+          }
+          return
+        }
         return
       }
 
@@ -2313,19 +2647,66 @@ export class Bridge {
     const entry = existing ?? { conversationId, parts: [] }
     entry.parts.push(text)
     if (entry.timer) clearTimeout(entry.timer)
+    // A block that arrives after the turn's end signal only needs the short
+    // settle window; without a signal the full grace applies so the blocks of a
+    // still-running turn can merge.
+    const delay = this.#settledTurns.has(sessionID)
+      ? Math.min(this.#config.turnSettleMs, this.#config.turnGraceMs)
+      : this.#config.turnGraceMs
     entry.timer = setTimeout(
       () =>
-        void this.#finishTurn(sessionID, "timer").catch((error) =>
+        void this.#finishTurn(sessionID, this.#settledTurns.has(sessionID) ? "idle" : "timer").catch((error) =>
           this.#log.warn(`turn flush failed: ${errorText(error)}`),
         ),
-      this.#config.turnGraceMs,
+      delay,
     )
     entry.timer.unref?.()
     this.#turns.set(sessionID, entry)
   }
 
+  /**
+   * A turn-completion signal arrived: shorten the pending wait.
+   *
+   * The final text block can arrive just after the signal, so this does not
+   * flush immediately — it replaces the full grace (`turnGraceMs`, 3 s) with the
+   * short settle window (`turnSettleMs`, 0.6 s). Every reply used to pay the
+   * full grace because the only signal the host actually sent was unreliable.
+   */
+  async #finishTurnSoon(sessionID: string): Promise<void> {
+    this.#settledTurns.add(sessionID)
+    const settle = Math.max(0, Math.min(this.#config.turnSettleMs, this.#config.turnGraceMs))
+    const turn = this.#turns.get(sessionID)
+    const live = this.#live.get(sessionID)
+    if (!turn && !live) return
+    if (settle <= 0) {
+      // Nothing to wait for: flush now, and let the caller await it.
+      await this.#finishTurn(sessionID, "idle")
+      return
+    }
+    const finish = (): void => {
+      void this.#finishTurn(sessionID, "idle").catch((error) =>
+        this.#log.warn(`turn flush failed: ${errorText(error)}`),
+      )
+    }
+    const timer = setTimeout(finish, settle)
+    timer.unref?.()
+    if (turn) {
+      if (turn.timer) clearTimeout(turn.timer)
+      turn.timer = timer
+      this.#turns.set(sessionID, turn)
+      return
+    }
+    if (live) {
+      // Live mode: the fragment interval is replaced by the one-shot settle.
+      if (live.timer) clearInterval(live.timer)
+      live.timer = timer
+      this.#live.set(sessionID, live)
+    }
+  }
+
   /** A turn ended: deliver whatever is left and stop the "typing" indicator. */
   async #finishTurn(sessionID: string, trigger: "idle" | "timer" | "failed" = "idle"): Promise<void> {
+    this.#settledTurns.delete(sessionID)
     const turn = this.#turns.get(sessionID)
     this.#turns.delete(sessionID)
     if (turn?.timer) clearTimeout(turn.timer)
@@ -2465,32 +2846,60 @@ export class Bridge {
     let chunks = chunkText(text, limit)
     if (chunks.length > 1) chunks = numberChunks(chunkText(text, Math.max(64, limit - 12)))
 
-    const hadQueue = this.#queueFor(conversationId).length > 0
     let delivered = true
-    let failedFrom = -1
-    for (const [index, chunk] of chunks.entries()) {
+    let queued = 0
+    for (const chunk of chunks) {
       const ok = await this.sendChunk(conversationId, chunk)
       if (ok) continue
       delivered = false
-      if (failedFrom < 0) failedFrom = index
+      // Every refusal queues exactly one item, so this is what the user will
+      // actually have to fetch — not a guess.
+      queued += 1
     }
 
-    if (failedFrom >= 0 && !hadQueue) {
-      // The tail is queued; say so in front of it, otherwise a half-delivered
-      // answer looks like the model stopped on its own and the user has no way
-      // to know that simply speaking will fetch the rest.
-      const waiting = chunks.length - failedFrom
-      this.#prependToQueue(
-        conversationId,
-        `⚠️ 上面那条没发完（还有 ${waiting} 段）。发一句话或 /more 我就把剩下的补上。`,
-      )
+    if (queued > 0) {
+      // Without a notice a half-delivered answer looks like the model stopped on
+      // its own, and the user has no way to know that simply speaking fetches
+      // the rest. Exactly one notice is kept, and its count comes from the queue.
+      this.#ensureNotice(conversationId)
     }
     return delivered
   }
 
-  /** Put a line at the head of a conversation's queue. */
-  #prependToQueue(conversationId: string, text: string): void {
-    this.#enqueue(conversationId, [text], true)
+  /**
+   * Keep at most one ⚠️ "not everything went out" notice at the head of a queue.
+   *
+   * The count is read off the queue itself (an earlier version guessed it from
+   * the failed send and could over- or under-count), the notice never stacks,
+   * and it is dropped as soon as its content is gone.
+   */
+  #ensureNotice(conversationId: string): void {
+    const queue = this.#queueFor(conversationId)
+    const content = queue.filter((item) => !item.text.startsWith(NOTICE_PREFIX))
+    const hadNotice = content.length !== queue.length
+    if (content.length === 0) {
+      if (hadNotice) this.#setQueue(conversationId, [])
+      return
+    }
+    const kept = content.slice(-QUEUE_LIMIT)
+    if (kept.length < content.length) {
+      this.#log.warn(`queue full: dropped ${content.length - kept.length} oldest item(s) for ${conversationId}`)
+    }
+    const notice: QueuedMessage = {
+      text: `${NOTICE_PREFIX}（还有 ${kept.length} 段）。发一句话或 /more 我就把剩下的补上。`,
+      clientId: newClientId(),
+    }
+    this.#setQueue(conversationId, [notice, ...kept])
+  }
+
+  /** Remove a stale notice (its content went out). */
+  #stripNotice(conversationId: string): void {
+    const queue = this.#queueFor(conversationId)
+    if (!queue.some((item) => item.text.startsWith(NOTICE_PREFIX))) return
+    this.#setQueue(
+      conversationId,
+      queue.filter((item) => !item.text.startsWith(NOTICE_PREFIX)),
+    )
   }
 
   /**
@@ -2501,15 +2910,18 @@ export class Bridge {
    * the user still learns that something was cut. Either way the drop is logged,
    * never silent.
    */
-  #enqueue(conversationId: string, items: string[], atHead = false): void {
+  #enqueue(conversationId: string, items: Array<string | QueuedMessage>, atHead = false): void {
     const queue = this.#queueFor(conversationId)
-    const merged = atHead ? [...items, ...queue] : [...queue, ...items]
+    const prepared: QueuedMessage[] = items.map((item) =>
+      typeof item === "string" ? { text: item, clientId: newClientId() } : item,
+    )
+    const merged = atHead ? [...prepared, ...queue] : [...queue, ...prepared]
     if (merged.length <= QUEUE_LIMIT) {
       this.#setQueue(conversationId, merged)
       return
     }
     const dropped = merged.length - QUEUE_LIMIT
-    const head = atHead ? Math.min(items.length, QUEUE_LIMIT) : 0
+    const head = atHead ? Math.min(prepared.length, QUEUE_LIMIT) : 0
     this.#log.warn(`queue full (${QUEUE_LIMIT}): dropped ${dropped} oldest item(s) for ${conversationId}`)
     this.#setQueue(conversationId, [
       ...merged.slice(0, head),
@@ -2613,7 +3025,7 @@ export class Bridge {
    * before giving up — but it is not logged as a success story, because the
    * refusal itself is the interesting fact.
    */
-  async #trySend(conversationId: string, chunk: string): Promise<SendRefusedError | undefined> {
+  async #trySend(conversationId: string, chunk: string, clientId?: string): Promise<SendRefusedError | undefined> {
     if (!this.#state.account?.token) this.reloadState()
     const account = this.#state.account
     if (!account?.token) return new SendRefusedError("微信通道尚未登录", LOCAL_FAILURE)
@@ -2623,7 +3035,7 @@ export class Bridge {
 
     const contextToken = this.#state.contextTokens[conversationId]
     try {
-      await sendText({ account, to: peerId, text: chunk, contextToken })
+      await sendText({ account, to: peerId, text: chunk, contextToken, clientId })
       this.#log.info(`sent ${chunk.length} chars to ${peerId.slice(0, 12)}…: ${preview(chunk)}`)
       return undefined
     } catch (error) {
@@ -2633,7 +3045,9 @@ export class Bridge {
       }
       if (contextToken) {
         try {
-          await sendText({ account, to: peerId, text: chunk })
+          // Same client id: the fallback is the same logical message, so a
+          // server that already accepted the first attempt dedupes this one.
+          await sendText({ account, to: peerId, text: chunk, clientId })
           this.#log.info(`sent ${chunk.length} chars without context token: ${preview(chunk)}`)
           return undefined
         } catch {
@@ -2652,7 +3066,8 @@ export class Bridge {
    * ordering their chunks would interleave on the phone.
    */
   async sendChunk(conversationId: string, chunk: string, throwOnFailure = false): Promise<boolean> {
-    return this.#chain(conversationId, () => this.#sendChunkNow(conversationId, chunk, throwOnFailure))
+    const clientId = newClientId()
+    return this.#chain(conversationId, () => this.#sendChunkNow(conversationId, chunk, clientId, throwOnFailure))
   }
 
   /**
@@ -2675,14 +3090,21 @@ export class Bridge {
     return next
   }
 
-  async #sendChunkNow(conversationId: string, chunk: string, throwOnFailure: boolean): Promise<boolean> {
-    const refused = await this.#trySend(conversationId, chunk)
+  async #sendChunkNow(
+    conversationId: string,
+    chunk: string,
+    clientId: string,
+    throwOnFailure: boolean,
+  ): Promise<boolean> {
+    const refused = await this.#trySend(conversationId, chunk, clientId)
     if (!refused) {
       if (this.#config.sendDelayMs > 0) await delay(this.#config.sendDelayMs)
       return true
     }
 
-    this.#enqueue(conversationId, [chunk])
+    // Queued with the id the failed attempt already used: the service dedupes on
+    // it, so an ambiguous timeout ("possibly delivered") cannot land twice.
+    this.#enqueue(conversationId, [{ text: chunk, clientId }])
     if (refused.errcode === LOCAL_FAILURE) {
       // Not a protocol refusal: the request may have reached the service before
       // the connection broke, so the retry can duplicate the message.
@@ -2701,17 +3123,37 @@ export class Bridge {
    * -------------------------------------------------------------------------
    */
 
-  /** Text waiting to be delivered to a conversation. */
-  #queueFor(conversationId: string): string[] {
-    return this.#state.pendingOutbound?.[conversationId] ?? []
+  /** Text waiting to be delivered to a conversation (legacy string entries are migrated). */
+  #queueFor(conversationId: string): QueuedMessage[] {
+    const raw = this.#state.pendingOutbound?.[conversationId] ?? []
+    let migrated = false
+    const items = raw.map((entry) => {
+      if (typeof entry !== "string") return entry
+      migrated = true
+      // Entries written before ids existed get one now, so their retries are
+      // deduped from this point on.
+      return { text: entry, clientId: newClientId() }
+    })
+    if (migrated) this.#setQueue(conversationId, items)
+    return items
   }
 
-  #setQueue(conversationId: string, items: string[]): void {
+  #setQueue(conversationId: string, items: QueuedMessage[]): void {
     this.#state = updateState((state) => {
       const next = { ...(state.pendingOutbound ?? {}) }
-      if (items.length === 0) delete next[conversationId]
-      else next[conversationId] = items
+      const since = { ...(state.pendingOutboundSince ?? {}) }
+      if (items.length === 0) {
+        delete next[conversationId]
+        delete since[conversationId]
+      } else {
+        next[conversationId] = items
+        // First write of this queue: remember when it appeared, so a parked
+        // queue nobody ever claims can expire instead of living in the state
+        // file forever.
+        if (since[conversationId] === undefined) since[conversationId] = Date.now()
+      }
       state.pendingOutbound = next
+      state.pendingOutboundSince = since
     })
   }
 
@@ -2787,15 +3229,25 @@ export class Bridge {
 
     const generation = this.#queueGenerations.get(conversationId) ?? 0
     let delivered = 0
+    let refusedAt = -1
     try {
       // Inside the try: a throwing state write here used to leave `#flushing`
       // set forever, stalling this conversation's queue until a restart.
       this.#flushing.add(conversationId)
-      this.#setQueue(conversationId, [])
-      for (const item of batch) {
-        const refused = await this.#chain(conversationId, () => this.#trySend(conversationId, item))
+      for (const [index, item] of batch.entries()) {
+        // Persist the remainder *before* sending: a crash or a reload mid-flush
+        // then loses at most the in-flight item — and that one carries a stable
+        // client id, so even a delivered-but-unacknowledged retry is deduped.
+        this.#setQueue(conversationId, batch.slice(index + 1))
+        const refused = await this.#chain(conversationId, () =>
+          this.#trySend(conversationId, item.text, item.clientId),
+        )
+        // Dropped while we were sending (`/cancel all`, `/queue clear`): the
+        // caller's generation check below must not resurrect it.
+        if ((this.#queueGenerations.get(conversationId) ?? 0) !== generation) return
         if (refused) {
           this.#log.warn(`queued send still refused (errcode=${refused.errcode})`)
+          refusedAt = index
           break
         }
         delivered += 1
@@ -2805,10 +3257,11 @@ export class Bridge {
       this.#flushing.delete(conversationId)
     }
 
-    const remaining = batch.slice(delivered)
     if (delivered > 0) this.#lastFlushedAt.set(conversationId, Date.now())
 
-    if (remaining.length === 0) {
+    if (refusedAt < 0) {
+      // Everything went out: a "parts are missing" notice would now be a lie.
+      this.#stripNotice(conversationId)
       this.#setRetryAttempt(conversationId, 0)
       if (this.#queueFor(conversationId).length > 0) this.#scheduleRetry(conversationId)
       return
@@ -2818,13 +3271,15 @@ export class Bridge {
     if ((this.#queueGenerations.get(conversationId) ?? 0) !== generation) return
 
     const appended = this.#queueFor(conversationId)
-    const merged = [...remaining, ...appended]
+    const merged = [...batch.slice(refusedAt), ...appended]
     if (merged.length > QUEUE_LIMIT) {
       // Never silent: the dropped items are the oldest, which may be the very
       // tail this flush was trying to deliver.
       this.#log.warn(`queue over ${QUEUE_LIMIT} after a flush: dropping ${merged.length - QUEUE_LIMIT} oldest item(s)`)
     }
     this.#setQueue(conversationId, merged.slice(-QUEUE_LIMIT))
+    // Re-derive the notice from what is really queued now.
+    this.#ensureNotice(conversationId)
     this.#scheduleRetry(conversationId)
   }
 
@@ -2835,18 +3290,20 @@ export class Bridge {
    */
 
   async #setTyping(conversationId: string, typing: boolean): Promise<void> {
-    const account = this.#state.account
-    if (!account?.token) return
-    const peerId = conversationId.split(":").pop()
-    if (!peerId) return
-
     if (!typing) {
+      // Cleared before the token check: with the credential gone (`-14`,
+      // `--logout`) that early return used to leave the 12 s refresh running
+      // forever, posting "typing…" with an account that no longer exists.
       const timer = this.#typingTimers.get(conversationId)
       if (timer) {
         clearInterval(timer)
         this.#typingTimers.delete(conversationId)
       }
     }
+    const account = this.#state.account
+    if (!account?.token) return
+    const peerId = conversationId.split(":").pop()
+    if (!peerId) return
 
     const ticket = this.#typingTickets.get(peerId) ?? (await this.#fetchTypingTicket(peerId))
     if (!ticket) return
@@ -2859,8 +3316,15 @@ export class Bridge {
     }
 
     if (!typing || this.#typingTimers.has(conversationId)) return
-    // The indicator expires on its own; refresh while the turn runs.
+    // The indicator expires on its own; refresh while the turn runs — with a
+    // hard stop, so a turn that never reports an end cannot leave it on forever.
+    const startedAt = Date.now()
     const timer = setInterval(() => {
+      if (Date.now() - startedAt > TYPING_MAX_MS) {
+        clearInterval(timer)
+        this.#typingTimers.delete(conversationId)
+        return
+      }
       void sendTyping({ account, userId: peerId, ticket, typing: true }).catch(() => {})
     }, 12_000)
     timer.unref?.()
@@ -2901,9 +3365,41 @@ function delay(ms: number): Promise<void> {
   return new Promise((resolve) => setTimeout(resolve, ms))
 }
 
-/** One-line, length-capped excerpt for log lines. */
+/**
+ * Normalise a user-typed argument for numeric/keyword comparisons.
+ *
+ * NFKC folds full-width digits and slashes (`２` → `2`) so an argument typed with
+ * a Chinese IME reaches the same handler as an ASCII one.
+ */
+function normalizeArgument(value: string): string {
+  return value.normalize("NFKC").trim()
+}
+
+/** Strip one matching pair of surrounding quotes: `"D:\code repo"` → `D:\code repo`. */
+function stripQuotes(value: string): string {
+  const trimmed = value.trim()
+  const match = /^(['"])([\s\S]*)\1$/.exec(trimmed)
+  return match ? (match[2] ?? "") : trimmed
+}
+
+/**
+ * Whether a message is a command.
+ *
+ * Checked on the NFKC-folded text so the full-width slash a Chinese IME emits
+ * (`／列表`) reaches the command handler instead of being sent to the model.
+ */
+function looksLikeCommand(text: string): boolean {
+  return text.normalize("NFKC").trimStart().startsWith("/")
+}
+
+/** One-line, length-capped excerpt for log lines.
+ *
+ * Credential shapes are redacted first: users paste tokens and passwords into
+ * chats, the log is written to disk unencrypted, and `/log` ships its tail back
+ * into the chat.
+ */
 function preview(text: string, limit = 80): string {
-  return text.replace(/\s+/g, " ").trim().slice(0, limit)
+  return redactSecrets(text.replace(/\s+/g, " ").trim()).slice(0, limit)
 }
 
 function summarizeToolInput(input: unknown): string {

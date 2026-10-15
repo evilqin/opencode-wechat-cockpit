@@ -161,7 +161,10 @@ function describeValue(field: ApiFormField, value: unknown): string {
  * validation failure from a legitimate answer that happens to be a string.
  */
 function convertValue(field: ApiFormField, raw: string): unknown {
-  const value = raw.trim()
+  // NFKC folds full-width digits/commas (`１，２`) so a Chinese IME's input means
+  // what the option list says. The choice values themselves are compared after
+  // that fold, and free text keeps its original characters.
+  const value = raw.normalize("NFKC").trim()
   const options = field.options ?? []
   const fromOption = (input: string): string | undefined => {
     // Only a bare integer is an option index. `parseInt` would happily read the

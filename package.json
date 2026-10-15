@@ -1,6 +1,6 @@
 {
   "name": "opencode-wechat-cockpit",
-  "version": "1.6.0",
+  "version": "1.7.0",
   "private": true,
   "type": "module",
   "description": "微信驾驶舱：用手机微信遥控本机 opencode —— 会话、审批、提问、附件、主动推送，带单轮询器自愈与完整测试",

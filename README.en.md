@@ -40,7 +40,7 @@ is built for "**you are away, the computer is working**":
 | 🔁 **Half an answer is still recoverable** | Multi-part replies are numbered `（1/3）…`; rate-limited parts are queued and re-sent automatically; `/more` (`/继续`) tells the two cases apart — **stuck text is re-sent without calling the model, only a genuinely unfinished answer asks it to continue** |
 | 🔁 **Duplicates cost nothing** | `message_id` dedup (last 200) so a redelivered message never triggers a second model call. |
 | 📚 **Manual on your phone** | `/help` for the overview, `/help attach` for one command, `/help 全部` for the full manual; `MANUAL.md` is generated from the same source as the bot's answers; `/list` supports paging. |
-| 🧪 **Tested** | 174 automated tests (unit + mock-iLink protocol + fake-context behaviour) with strict type checking (including `noUnusedLocals`). Real-device verification is at the bottom. |
+| 🧪 **Tested** | 200 automated tests (unit + mock-iLink protocol + fake-context behaviour) with strict type checking (including `noUnusedLocals`). Real-device verification is at the bottom. |
 
 ## Quickstart
 
@@ -103,7 +103,7 @@ bun ~/.config/opencode/plugins/wechat/login-cli.ts
 ```
 
 Scan the QR code and confirm on the phone. Credentials go to
-`~/.config/opencode/wechat/state.json` (mode 0600).
+`~/.config/opencode/wechat/state.json` (0600 on POSIX; on Windows the file inherits the profile ACL).
 
 Or stay in the GUI: type `/wechat-login` in an opencode session and the QR code is posted
 into that session.
@@ -198,7 +198,8 @@ whatever you reply becomes the tool's return value.
   "progress": "tools",             // tools = one line per tool call; off = final answer only
   "stream": "off",                 // live = push text while it is still being written
   "streamIntervalMs": 8000,        // live push interval
-  "turnGraceMs": 3000,             // how long a finished text block waits for "idle" before being sent
+  "turnGraceMs": 3000,             // how long a finished text block waits when no end signal arrives
+  "turnSettleMs": 600,             // settle window after the real end signal (session.status idle)
   "mirrorAll": false,              // also push results of sessions that are not bound to WeChat
   "followActive": false,           // auto-follow the session the desktop is working in
   "followHoldMs": 300000,          // manual switch wins for this long
@@ -245,10 +246,11 @@ retries with 5s → 15s → 45s → 2min → 5min backoff, and **flushes the que
 send anything**. Media (files/images) are stricter than text.
 
 **Replies, but not forever.** WeChat cannot edit messages, so text is assembled per turn and
-sent when the turn ends (`session.idle`) — with a fallback: `turnGraceMs` (default 3 s) sends
-it anyway if that signal never arrives. That value **is** the "the computer already answered,
-why is the phone late" delay; the log line `reply sent (trigger: idle|timer)` tells you which
-path delivered.
+sent when the turn ends. The real end signal in v2 is `session.status` (`status.type: "idle"`)
+plus `session.execution.succeeded` (`session.idle` never arrived in practice); after it the reply
+waits only `turnSettleMs` (0.6 s) so a trailing text block can still merge. If no signal arrives
+at all, `turnGraceMs` (3 s) is the fallback. The log line `reply sent (trigger: idle|timer)` says
+which path delivered.
 
 **Cursor before dispatch.** The long-poll cursor is written to disk before messages are
 handled: a crash replays, it does not drop.
@@ -271,7 +273,7 @@ Logs: `~/.config/opencode/wechat/bridge.log`; `/status` and `/log` work from WeC
 | no reaction to messages | no `poller started` in the log: log in first. Fresh heartbeat but stale `polledAt`: taken over within 2 minutes |
 | answer did not come back | look for `send refused`; `-2 prepare failed` = window closed (auto-flushed later), `-14` = token expired |
 | the answer stops halfway | multi-part replies are numbered `（1/3）（2/3）…`; a missing number means it was rate-limited — send `/more` to fetch the rest (with something stuck it **only re-sends, without calling the model**); send `/more` again to make the model continue writing |
-| computer answered, phone lags | reply delay = `turnGraceMs` (3 s) + backoff if refused; check `reply sent (trigger: …)` |
+| computer answered, phone lags | the normal path is "end signal + `turnSettleMs` (0.6 s)"; the 3 s `turnGraceMs` only applies when no signal arrives. Check `reply sent (trigger: …)` |
 | grey box instead of an image | `aes_key` encoding was wrong (must be base64 of hex text) — fixed here; open an issue if you see it |
 | `/list` misses desktop sessions | the local API is unavailable (`verify.ts` says so); only WeChat-created sessions are listed |
 | same message handled twice | should not happen: `message_id` dedup + single poller |
@@ -285,7 +287,7 @@ Logs: `~/.config/opencode/wechat/bridge.log`; `/status` and `/log` work from WeC
 
 ```bash
 cd types && bun install  # one-time: the official types (types/ is gitignored)
-bun test          # 174 tests: unit + mock iLink + fake-context Bridge behaviour
+bun test          # 200 tests: unit + mock iLink + fake-context Bridge behaviour
 bun run typecheck # strict check against the official @opencode/plugin types
 bun verify.ts     # environment self-check
 bun gen-manual.ts # regenerate MANUAL.md after editing manual.ts
@@ -348,7 +350,8 @@ Not yet exercised on real hardware (covered by tests): paging (`/list 2`, `/list
 - After the QR scan, the bot is cryptographically bound to your WeChat account: the server only
   delivers that account's messages, the bot is not a contact, cannot be searched, cannot be
   added. `allowedUsers` adds another layer.
-- Credentials live only on this machine (0600, under `~/.config/opencode/wechat/`, **never in
+- Credentials live only on this machine (0600 on POSIX, the profile ACL on Windows, under
+  `~/.config/opencode/wechat/`, **never in
   this repo**).
 - **The agent runs as you.** Sessions coming from WeChat inherit your permission settings;
   anything that needs approval is forwarded to WeChat. Loosen your agent's permissions for
@@ -361,8 +364,8 @@ Not yet exercised on real hardware (covered by tests): paging (`/list 2`, `/list
 - Outbound: text, image, video, file. **Sending voice is not implemented.** Inbound voice prefers
   WeChat's transcription; without one the `.silk` file is saved to the inbox and the note says the
   bridge does not transcribe it (add your own ASR if you need text).
-- **A send that times out may be delivered twice**: a timeout is ambiguous (the service may have
-  accepted it), and the bridge prefers a duplicate over a lost answer.
+- **A retried send is not delivered twice**: every queued message carries a stable `client_id` (reused for
+  retries, the context-token fallback and plugin reloads) and the service dedupes on it.
 - Agent forms go through the local API, so in `--standalone` mode with a registration pointing
   at another process, questions have to be answered on the computer.
 - The opencode v2 plugin API is beta; interface changes will need a follow-up.

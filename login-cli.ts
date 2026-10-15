@@ -13,7 +13,15 @@
 import { createInterface } from "node:readline"
 import { join } from "node:path"
 import { login, sleep } from "./ilink.ts"
-import { readState, updateState, STATE_DIR, STATE_PATH, LOCK_PATH } from "./state.ts"
+import {
+  acquireLoginLock,
+  readState,
+  removeQrPng,
+  updateState,
+  STATE_DIR,
+  STATE_PATH,
+  LOCK_PATH,
+} from "./state.ts"
 import { readConfig } from "./config.ts"
 
 const args = new Set(process.argv.slice(2))
@@ -84,7 +92,7 @@ function ask(question: string): Promise<string | undefined> {
 
 async function main(): Promise<void> {
   if (args.has("--help") || args.has("-h")) {
-    console.log("用法：bun login-cli.ts [--status|--logout|--force]")
+    console.log("用法：bun login-cli.ts [--status|--logout|--purge|--force]")
     return
   }
 
@@ -106,14 +114,36 @@ async function main(): Promise<void> {
     const state = readState()
     if (!state.account) {
       console.log("当前没有登录信息。")
+      removeQrPng()
       return
     }
     updateState((draft) => {
+      // The token itself is not a credential to keep, but the server needs it to
+      // recognise the binding on the *next* login: dropping it entirely made the
+      // next scan create a second bot identity instead of reusing this one.
+      const kept = [draft.account?.token, ...(draft.previousTokens ?? [])].filter(
+        (token): token is string => Boolean(token),
+      )
+      draft.previousTokens = [...new Set(kept)].slice(0, 3)
       draft.account = undefined
       draft.syncBuf = undefined
     })
-    console.log("已清除本地凭据（0600 状态文件里的 token 已删除）。")
-    console.log("opencode 最多 10 秒内会停止轮询；若微信里的机器人仍然存在，重新登录时会复用同一个绑定。")
+    // A stale QR image is a credential: it must not outlive the login it belongs to.
+    removeQrPng()
+    console.log("已清除本地凭据（状态文件里的 token 已删除，只保留用于重新绑定的旧 token）。")
+    console.log("opencode 最多 10 秒内会停止轮询；重新扫码会复用同一个绑定。")
+    console.log("想彻底清空（连旧 token 也不留）：bun login-cli.ts --purge")
+    return
+  }
+
+  if (args.has("--purge")) {
+    updateState((draft) => {
+      draft.account = undefined
+      draft.previousTokens = []
+      draft.syncBuf = undefined
+    })
+    removeQrPng()
+    console.log("已彻底清除本地凭据与旧 token；下次扫码会创建新的绑定。")
     return
   }
 
@@ -124,9 +154,22 @@ async function main(): Promise<void> {
     return
   }
 
-  const existingTokens = state.account?.token ? [state.account.token] : []
-  const result = await login({
-    existingTokens,
+  const existingTokens = [...new Set([
+    ...(state.previousTokens ?? []),
+    ...(state.account?.token ? [state.account.token] : []),
+  ])]
+  // One login at a time: two concurrent QR flows race for the same state file
+  // and orphan one of the two bindings the server creates.
+  const releaseLogin = acquireLoginLock()
+  if (!releaseLogin) {
+    console.log("已经有一个登录流程在进行（可能是另一个终端窗口，或 opencode 里的 /wechat-login）。")
+    console.log("等它结束再试；如果确定没有别的流程，删掉状态目录里的 login.lock 即可。")
+    process.exitCode = 1
+    return
+  }
+  try {
+    const result = await login({
+      existingTokens,
     onEventError: (error) => {
       console.error("登录事件处理出错：", error instanceof Error ? error.message : String(error))
     },
@@ -166,35 +209,41 @@ async function main(): Promise<void> {
     requestVerifyCode: async (attempt) => ask(`服务端要求输入配对验证码（第 ${attempt} 次），直接回车放弃：`),
   })
 
-  if (result.account) {
-    updateState((draft) => {
-      draft.account = result.account
-      draft.syncBuf = undefined
-    })
-    console.log(`凭据已保存到 ${STATE_PATH}（权限 0600）。`)
-    console.log("现在可以在微信里给这个机器人发消息了；opencode 正在运行时会在几秒内接上。")
-    if (result.alreadyBound) {
-      console.log("提示：服务端报告该账号此前已绑定，本次沿用了原绑定。")
-    }
-    return
-  }
-
-  if (result.alreadyBound) {
-    if (readState().account?.token) {
-      console.log("服务端报告该账号已绑定到现有 bot，本地凭据仍然可用。")
+    if (result.account) {
+      updateState((draft) => {
+        draft.account = result.account
+        draft.syncBuf = undefined
+      })
+      console.log(`凭据已保存到 ${STATE_PATH}。`)
+      console.log("现在可以在微信里给这个机器人发消息了；opencode 正在运行时会在几秒内接上。")
+      if (result.alreadyBound) {
+        console.log("提示：服务端报告该账号此前已绑定，本次沿用了原绑定。")
+      }
       return
     }
-    // The binding lives on the server but this machine holds no credential for
-    // it: reporting success here is how a "logged in" channel ends up dead.
-    console.log("服务端报告该账号已绑定到某个 bot，但本机没有对应凭据。")
-    console.log("如果绑定在另一台机器上：先在那台机器执行 --logout，再回来扫码。")
-    process.exitCode = 1
-    return
-  }
 
-  console.log(`未完成登录：${result.reason ?? "未知原因"}`)
-  await sleep(200)
-  process.exitCode = 1
+    if (result.alreadyBound) {
+      if (readState().account?.token) {
+        console.log("服务端报告该账号已绑定到现有 bot，本地凭据仍然可用。")
+        return
+      }
+      // The binding lives on the server but this machine holds no credential for
+      // it: reporting success here is how a "logged in" channel ends up dead.
+      console.log("服务端报告该账号已绑定到某个 bot，但本机没有对应凭据。")
+      console.log("如果绑定在另一台机器上：先在那台机器执行 --logout，再回来扫码。")
+      process.exitCode = 1
+      return
+    }
+
+    console.log(`未完成登录：${result.reason ?? "未知原因"}`)
+    await sleep(200)
+    process.exitCode = 1
+  } finally {
+    // Both the lock and the QR bitmap are credentials: neither may outlive the
+    // flow that created them.
+    releaseLogin()
+    removeQrPng()
+  }
 }
 
 main().catch((error) => {

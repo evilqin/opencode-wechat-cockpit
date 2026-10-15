@@ -45,6 +45,17 @@ export interface WechatConfig {
    * short. `0` sends each finished block as soon as it ends.
    */
   turnGraceMs: number
+  /**
+   * How long to wait after a turn-completion signal before delivering.
+   *
+   * v2 emits `session.status` (`status.type: "idle"`) and
+   * `session.execution.succeeded` when a turn really ended — far more reliable
+   * than `session.idle`, which never arrived in practice (317 measured replies
+   * were all delivered by the grace timer). The wait is short because it only
+   * exists to let a final text block, which can arrive just after the signal,
+   * merge into the same reply. Capped by `turnGraceMs`.
+   */
+  turnSettleMs: number
   /** Rename the session after the first message so the phone shows something meaningful. */
   autoTitle: boolean
   /** Delay between outbound chunks: bursts are more likely to be refused. */
@@ -99,6 +110,7 @@ export const DEFAULT_CONFIG: WechatConfig = {
   stream: "off",
   streamIntervalMs: 8_000,
   turnGraceMs: 3_000,
+  turnSettleMs: 600,
   autoTitle: true,
   sendDelayMs: 250,
   ack: "off",
@@ -134,6 +146,7 @@ export function normalizeConfig(input: Partial<WechatConfig> | undefined): Wecha
     stream: raw.stream === "live" ? "live" : "off",
     streamIntervalMs: pickNumber(raw.streamIntervalMs, DEFAULT_CONFIG.streamIntervalMs, 1_000),
     turnGraceMs: pickNumber(raw.turnGraceMs, DEFAULT_CONFIG.turnGraceMs, 0),
+    turnSettleMs: pickNumber(raw.turnSettleMs, DEFAULT_CONFIG.turnSettleMs, 0),
     autoTitle: raw.autoTitle !== false,
     sendDelayMs: pickNumber(raw.sendDelayMs, DEFAULT_CONFIG.sendDelayMs, 0),
     ack: raw.ack === "text" ? "text" : "off",

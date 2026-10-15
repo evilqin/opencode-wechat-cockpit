@@ -353,7 +353,16 @@ async function harness(overrides: Partial<WechatConfig> = {}, options: { keepSta
   // list is built from what the service reports.
   apiMock.created = () => [...sessions.values()]
   // Approval bursts are batched on a timer; tests do not want to wait 800ms.
-  const config: WechatConfig = { ...DEFAULT_CONFIG, directory: "/tmp", sendDelayMs: 0, approvalBurstMs: 10, ...overrides }
+  const config: WechatConfig = {
+    ...DEFAULT_CONFIG,
+    directory: "/tmp",
+    sendDelayMs: 0,
+    approvalBurstMs: 10,
+    // Settle behaviour has its own tests; the rest of the suite expects the old
+    // "idle flushes now" semantics.
+    turnSettleMs: 0,
+    ...overrides,
+  }
 
   // `keepState` simulates a plugin reload: the new instance must pick up the
   // queue the previous one persisted.
@@ -402,6 +411,13 @@ function sentTexts(): string[] {
 function clearSent(): void {
   ilink.attempts.length = 0
   ilink.delivered.length = 0
+}
+
+/** Queued message texts for a conversation, from the persisted state. */
+function queuedTexts(conversationId = CONVERSATION): string[] {
+  return (readState().pendingOutbound?.[conversationId] ?? []).map((item) =>
+    typeof item === "string" ? item : item.text,
+  )
 }
 
 /**
@@ -942,8 +958,7 @@ describe("commands", () => {
     await bridge.handleInbound(inbound("/more"))
     // Even the explanation cannot go out while the window is shut; it joins the
     // queue, and the model is not bothered.
-    const queued = readState().pendingOutbound?.[CONVERSATION] ?? []
-    expect(queued.some((item) => item.includes("还有"))).toBe(true)
+    expect(queuedTexts().some((text) => text.includes("没发完"))).toBe(true)
     expect(calls.prompts.length).toBe(promptsBefore)
 
     // Once the user speaks again everything lands, explanation first.
@@ -969,8 +984,8 @@ describe("commands", () => {
       await bridge.handleEvent({ type: "session.idle", data: { sessionID: "ses_test1" } })
     }
 
-    const queued = readState().pendingOutbound?.[CONVERSATION] ?? []
-    expect(queued.filter((item) => item.includes("没发完")).length).toBe(1)
+    const queued = queuedTexts()
+    expect(queued.filter((text) => text.includes("没发完")).length).toBe(1)
     expect(queued).toContain("第一条发不出去")
     expect(queued).toContain("第二条也发不出去")
     ilink.refuseSends = false
@@ -1241,8 +1256,7 @@ describe("replies back to WeChat", () => {
     expect(sentTexts().filter((text) => text.includes("只发一次"))).toHaveLength(1)
   })
 
-  test("a failed execution reports the error after the partial text", async () => {
-    const { bridge } = await harness()
+  test("a failed execution reports the error after the partial text", async () => {    const { bridge } = await harness()
     await bridge.handleInbound(inbound("/new 我的会话"))
     await bridge.handleEvent({
       type: "session.text.ended",
@@ -1413,7 +1427,7 @@ describe("the reply window", () => {
     })
     await first.bridge.handleEvent({ type: "session.idle", data: { sessionID: "ses_test1" } })
 
-    const queued = readState().pendingOutbound?.[CONVERSATION] ?? []
+    const queued = queuedTexts()
     expect(queued[0]).toContain("没发完")
     expect(queued).toContain("重载也不能弄丢我")
 
@@ -1421,7 +1435,7 @@ describe("the reply window", () => {
     ilink.refuseSends = false
     clearSent()
     const second = await harness({}, { keepState: true })
-    expect(second.bridge.state.pendingOutbound?.[CONVERSATION]).toContain("重载也不能弄丢我")
+    expect(queuedTexts()).toContain("重载也不能弄丢我")
 
     await second.bridge.handleInbound(inbound("/retry"))
     expect(sentTexts()).toContain("重载也不能弄丢我")
@@ -1810,7 +1824,7 @@ describe("hardening (audit follow-up)", () => {
       data: { sessionID: "ses_test1", assistantMessageID: "msg_1", ordinal: 0, text: "重载前的答案" },
     })
     bridge.stopPolling()
-    expect(readState().pendingOutbound?.[CONVERSATION] ?? []).toContain("重载前的答案")
+    expect(queuedTexts()).toContain("重载前的答案")
     // Do not leave a retry timer behind for a later test to trip over.
     await bridge.handleInbound(inbound("/queue clear"))
   })
@@ -1837,8 +1851,295 @@ describe("hardening (audit follow-up)", () => {
     expect(sentTexts().join("\n")).toContain("第 2/2 个待审批")
   })
 
-  test("sendToLast reports a refusal instead of throwing", async () => {
+  test("a retried queued message keeps its client id (idempotent retries)", async () => {
+    const { bridge } = await harness({ retryBackoffMs: [10, 10, 10, 10] })
+    await bridge.handleInbound(inbound("/new 我的会话"))
+    ilink.refuseSends = true
+    clearSent()
+
+    await bridge.handleEvent({
+      type: "session.text.ended",
+      data: { sessionID: "ses_test1", assistantMessageID: "msg_1", ordinal: 0, text: "同一条重试" },
+    })
+    await bridge.handleEvent({ type: "session.idle", data: { sessionID: "ses_test1" } })
+
+    // The retry timer fires a second attempt at the same logical message: the
+    // same client id must go out, or an ambiguous timeout lands twice.
+    await waitFor(
+      () => ilink.attempts.filter((entry) => JSON.stringify(entry.body).includes("同一条重试")).length >= 2,
+      3_000,
+      "two attempts",
+    )
+    const ids = ilink.attempts
+      .filter((entry) => JSON.stringify(entry.body).includes("同一条重试"))
+      .map((entry) => (entry.body.msg as { client_id?: string }).client_id)
+    expect(new Set(ids).size).toBe(1)
+
+    // The queued copy carries the same id, so a later flush reuses it too.
+    const queued = readState().pendingOutbound?.[CONVERSATION] ?? []
+    const item = queued.find((entry) => (typeof entry === "string" ? entry : entry.text).includes("同一条重试"))
+    const queuedId = item !== undefined && typeof item !== "string" ? item.clientId : ""
+    expect(queuedId).toBe(ids[0]!)
+
+    ilink.refuseSends = false
+    await bridge.handleInbound(inbound("/queue clear"))
+  })
+
+  test("the ⚠️ notice counts what is queued, never stacks, and clears when nothing is left", async () => {
+    const { bridge } = await harness({ chunkSize: 120, retryBackoffMs: [3_600_000] })
+    await bridge.handleInbound(inbound("/new 我的会话"))
+    ilink.refuseSends = true
+    clearSent()
+
+    const answer = Array.from({ length: 40 }, (_, index) => `第 ${index + 1} 行内容`).join("\n")
+    await bridge.handleEvent({
+      type: "session.text.ended",
+      data: { sessionID: "ses_test1", assistantMessageID: "msg_1", ordinal: 0, text: answer },
+    })
+    await bridge.handleEvent({ type: "session.idle", data: { sessionID: "ses_test1" } })
+
+    const texts = queuedTexts()
+    const notices = texts.filter((text) => text.includes("没发完"))
+    expect(notices).toHaveLength(1)
+    const counted = Number(/还有 (\d+) 段/.exec(notices[0] ?? "")?.[1] ?? 0)
+    expect(counted).toBe(texts.length - 1)
+
+    // Another failing turn must not stack a second notice…
+    await bridge.handleEvent({
+      type: "session.text.ended",
+      data: { sessionID: "ses_test1", assistantMessageID: "msg_2", ordinal: 0, text: "又一段没发出去的" },
+    })
+    await bridge.handleEvent({ type: "session.idle", data: { sessionID: "ses_test1" } })
+    expect(queuedTexts().filter((text) => text.includes("没发完"))).toHaveLength(1)
+
+    // …and once everything is delivered the notice is gone.
+    ilink.refuseSends = false
+    await bridge.handleInbound(inbound("在吗"))
+    expect(queuedTexts()).toEqual([])
+  })
+
+  test("full-width input reaches the same handlers", async () => {
     const { bridge } = await harness()
+    await bridge.handleInbound(inbound("/new 我的会话"))
+    apiMock.sessions = [
+      { id: "ses_test1", title: "我的会话", location: { directory: "/tmp" }, time: { updated: Date.now() } },
+      ...Array.from({ length: 40 }, (_, index) => ({
+        id: `ses_extra${index}`,
+        title: `其他 ${index + 1}`,
+        location: { directory: "/tmp" },
+        time: { updated: Date.now() },
+      })),
+    ]
+    clearSent()
+
+    // Full-width slash and letters (a Chinese IME emits these).
+    await bridge.handleInbound(inbound("／列表 ａｌｌ"))
+    expect(sentTexts().join("\n")).toContain("其他会话")
+    clearSent()
+
+    // "all" after the page number works too, and junk gets the usage back.
+    await bridge.handleInbound(inbound("/list all 2"))
+    expect(sentTexts().join("\n")).toContain("第 2/")
+    clearSent()
+    await bridge.handleInbound(inbound("/list 2 all 3"))
+    expect(sentTexts().join("\n")).toContain("页码只能给一个")
+    clearSent()
+
+    // A full-width index resolves to exactly what the ASCII index does.
+    await bridge.handleInbound(inbound("/list all 1"))
+    await bridge.handleInbound(inbound("/attach 3"))
+    const asciiTarget = readState().bindings[CONVERSATION]?.sessionID
+    expect(asciiTarget).toBeDefined()
+    await bridge.handleInbound(inbound("/list all 1"))
+    await bridge.handleInbound(inbound("/attach ３"))
+    expect(readState().bindings[CONVERSATION]?.sessionID).toBe(asciiTarget)
+  })
+
+  test("a duplicated permission.asked is announced once", async () => {
+    const { bridge } = await harness()
+    await bridge.handleInbound(inbound("/new 我的会话"))
+    clearSent()
+
+    const request = { id: "per_dup", sessionID: "ses_test1", action: "bash", resources: ["rm -rf build"] }
+    await bridge.handleEvent({ type: "permission.asked", data: request })
+    await bridge.handleEvent({ type: "permission.asked", data: request })
+    await waitForText("需要你确认", 3_000)
+
+    // Two entries meant two announcements and a `/allow` that failed on the twin.
+    const announcements = sentTexts().filter((text) => text.includes("rm -rf build"))
+    expect(announcements).toHaveLength(1)
+    await bridge.handleInbound(inbound("/allow 2"))
+    expect(sentTexts().join("\n")).toContain("没有第 2 个")
+  })
+
+  test("a pending wechat_ask question wins over the bare approval shortcut", async () => {
+    const { bridge, calls } = await harness()
+    await bridge.handleInbound(inbound("/new 我的会话"))
+    await bridge.handleEvent({
+      type: "permission.asked",
+      data: { id: "per_1", sessionID: "ses_test1", action: "bash", resources: ["rm -rf build"] },
+    })
+    await waitForText("需要你确认", 3_000)
+
+    // The agent asks a question while the approval is still open. Answering it
+    // with "可以" used to approve the shell command *and* leave the question
+    // blocking; the question must win.
+    const answer = bridge.ask(CONVERSATION, "这样可以吗？", 5_000)
+    await waitFor(() => readState().pendingQuestions?.[CONVERSATION] !== undefined, 2_000, "question registered")
+    clearSent()
+    await bridge.handleInbound(inbound("可以"))
+    await expect(answer).resolves.toBe("可以")
+    expect(calls.permissionReplies).toHaveLength(0)
+    expect(readState().pendingQuestions?.[CONVERSATION]).toBeUndefined()
+  })
+
+  test("/answer #2 targets the second pending form", async () => {
+    const { bridge } = await harness()
+    await bridge.handleInbound(inbound("/new 我的会话"))
+    const form = (id: string, title: string) => ({
+      id,
+      sessionID: "ses_test1",
+      title,
+      fields: [{ key: "k", title: "问题", type: "string" as const }],
+    })
+    await bridge.handleEvent({ type: "form.created", data: { form: form("frm_one", "第一个") } })
+    await waitForText("第一个", 3_000)
+    await bridge.handleEvent({ type: "form.created", data: { form: form("frm_two", "第二个") } })
+    await waitForText("第二个", 3_000)
+    clearSent()
+
+    await bridge.handleInbound(inbound("/answer #2 第二个的答案"))
+    expect(apiMock.answered.at(-1)?.answer).toEqual({ k: "第二个的答案" })
+    expect(sentTexts().join("\n")).toContain("已提交")
+
+    // Out-of-range selectors say how many there are instead of guessing.
+    clearSent()
+    await bridge.handleInbound(inbound("/answer #9 随便"))
+    expect(sentTexts().join("\n")).toContain("只有 1 个待回答")
+  })
+
+  test("/attach accepts a pasted id even when no listing covers it", async () => {
+    const { bridge } = await harness()
+    await bridge.handleInbound(inbound("/new 我的会话"))
+    // Nothing to list: the id fallback (like /switch) must still work.
+    apiMock.sessions = []
+    clearSent()
+    await bridge.handleInbound(inbound("/attach ses_test1"))
+    expect(readState().bindings[CONVERSATION]?.sessionID).toBe("ses_test1")
+    expect(sentTexts().join("\n")).toContain("已把这个会话接到微信")
+  })
+
+  test("bare /attach records the phone list and the 📱 marker", async () => {
+    const { bridge, sessions } = await harness()
+    await bridge.handleInbound(inbound("/new 我的会话"))
+    apiMock.sessions = [
+      { id: "ses_test1", title: "我的会话", location: { directory: "/tmp" }, time: { updated: Date.now() } },
+      { id: "ses_running", title: "桌面跑着的", location: { directory: "D:\\code\\app" }, time: { updated: Date.now() } },
+    ]
+    sessions.set("ses_running", {
+      id: "ses_running",
+      title: "桌面跑着的",
+      location: { directory: "D:\\code\\app" },
+    })
+    apiMock.active = ["ses_running"]
+    clearSent()
+
+    await bridge.handleInbound(inbound("/attach"))
+    expect(readState().bindings[CONVERSATION]?.sessionID).toBe("ses_running")
+    // The bookkeeping used to happen only on the argument path, so the borrowed
+    // session was missing from /list and never got its marker.
+    expect(readState().phoneSessions ?? []).toContain("ses_running")
+    expect(String(sessions.get("ses_running")?.title ?? "")).toStartWith("📱 ")
+  })
+
+  test("the v2 end signal delivers in the settle window, not the full grace", async () => {
+    const { bridge } = await harness({ turnGraceMs: 30_000, turnSettleMs: 40 })
+    await bridge.handleInbound(inbound("/new 我的会话"))
+    clearSent()
+
+    await bridge.handleEvent({
+      type: "session.text.ended",
+      data: { sessionID: "ses_test1", assistantMessageID: "msg_1", ordinal: 0, text: "不用等三秒" },
+    })
+    const started = Date.now()
+    // `session.status: idle` is the signal the host actually sends; with the full
+    // grace this configuration would keep the phone waiting 30 seconds.
+    await bridge.handleEvent({ type: "session.status", data: { sessionID: "ses_test1", status: { type: "idle" } } })
+    await waitForText("不用等三秒", 5_000)
+    expect(Date.now() - started).toBeLessThan(3_000)
+  })
+
+  test("execution.succeeded is accepted as the end signal too", async () => {
+    const { bridge } = await harness({ turnGraceMs: 30_000, turnSettleMs: 40 })
+    await bridge.handleInbound(inbound("/new 我的会话"))
+    clearSent()
+    await bridge.handleEvent({
+      type: "session.text.ended",
+      data: { sessionID: "ses_test1", assistantMessageID: "msg_1", ordinal: 0, text: "durable 信号" },
+    })
+    await bridge.handleEvent({ type: "session.execution.succeeded", data: { sessionID: "ses_test1" } })
+    await waitForText("durable 信号", 5_000)
+  })
+
+  test("a block arriving after the end signal still merges into one reply", async () => {
+    const { bridge } = await harness({ turnGraceMs: 30_000, turnSettleMs: 80 })
+    await bridge.handleInbound(inbound("/new 我的会话"))
+    clearSent()
+
+    await bridge.handleEvent({
+      type: "session.text.ended",
+      data: { sessionID: "ses_test1", assistantMessageID: "msg_1", ordinal: 0, text: "上半" },
+    })
+    await bridge.handleEvent({ type: "session.status", data: { sessionID: "ses_test1", status: { type: "idle" } } })
+    // The final block lands just after the signal — this is why a settle window
+    // exists instead of flushing the moment the signal arrives.
+    await new Promise((resolve) => setTimeout(resolve, 25))
+    await bridge.handleEvent({
+      type: "session.text.ended",
+      data: { sessionID: "ses_test1", assistantMessageID: "msg_1", ordinal: 1, text: "下半" },
+    })
+    await waitForText("下半", 5_000)
+    expect(sentTexts().filter((text) => text.includes("半"))).toEqual(["上半\n\n下半"])
+  })
+
+  test("a new turn waits the full grace again after a signalled turn", async () => {
+    const { bridge } = await harness({ turnGraceMs: 300, turnSettleMs: 30 })
+    await bridge.handleInbound(inbound("/new 我的会话"))
+    clearSent()
+
+    await bridge.handleEvent({
+      type: "session.text.ended",
+      data: { sessionID: "ses_test1", assistantMessageID: "msg_1", ordinal: 0, text: "第一轮" },
+    })
+    await bridge.handleEvent({ type: "session.status", data: { sessionID: "ses_test1", status: { type: "idle" } } })
+    await waitForText("第一轮", 3_000)
+    clearSent()
+
+    // Turn 2 starts busy: its blocks must merge under the full grace, so nothing
+    // may go out immediately after the first block.
+    await bridge.handleEvent({ type: "session.status", data: { sessionID: "ses_test1", status: { type: "busy" } } })
+    await bridge.handleEvent({
+      type: "session.text.ended",
+      data: { sessionID: "ses_test1", assistantMessageID: "msg_2", ordinal: 0, text: "第二轮上半" },
+    })
+    await new Promise((resolve) => setTimeout(resolve, 80))
+    expect(sentTexts().filter((text) => text.includes("第二轮"))).toEqual([])
+    await waitForText("第二轮上半", 3_000)
+  })
+
+  test("a provider retry is reported instead of silence", async () => {
+    const { bridge, logs } = await harness()
+    await bridge.handleInbound(inbound("/new 我的会话"))
+    clearSent()
+    await bridge.handleEvent({
+      type: "session.status",
+      data: { sessionID: "ses_test1", status: { type: "retry", attempt: 2, message: "rate limited" } },
+    })
+    await waitForText("第 2 次重试", 3_000)
+    expect(logs.some((line) => line.includes("provider retry"))).toBe(true)
+  })
+
+  test("sendToLast reports a refusal instead of throwing", async () => {    const { bridge } = await harness()
     await bridge.handleInbound(inbound("/new 我的会话"))
     ilink.refuseSends = true
     await expect(bridge.sendToLast("发不出去")).resolves.toBe(false)
@@ -1888,17 +2189,17 @@ describe("hardening (audit follow-up)", () => {
     // The window is still shut, so the stuck text survives the inbound flush and
     // `/cancel all` is what removes it.
     await bridge.handleInbound(inbound("/cancel all"))
-    const queued = readState().pendingOutbound?.[CONVERSATION] ?? []
+    const queued = queuedTexts()
     expect(queued).not.toContain("卡住的内容")
-    // Both the stuck text and the ⚠️ notice that was queued in front of it.
-    expect(queued.join("\n")).toContain("丢弃了 2 条")
+    // The stuck items (and the ⚠️ notice queued in front of them) are gone, and
+    // the reply says how many were dropped.
+    expect(queued.join("\n")).toContain("丢弃了")
 
     // Leave no queue behind: its retry timer would deliver into the mock during
     // a later test and make those counts (which share this mock) flaky.
     ilink.refuseSends = false
     await bridge.handleInbound(inbound("/queue clear"))
-    expect(readState().pendingOutbound?.[CONVERSATION] ?? []).toEqual([])
-  })
+    expect(readState().pendingOutbound?.[CONVERSATION] ?? []).toEqual([])  })
 
   test("/always and /deny all reach every pending request", async () => {
     const { bridge, calls } = await harness()

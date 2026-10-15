@@ -31,6 +31,8 @@ import {
   fileItem,
   getUploadUrl,
   imageItem,
+  isTrustedUrl,
+  redactSecrets,
   videoItem,
   type MessageItem,
   type MediaRef,
@@ -47,7 +49,7 @@ export interface DownloadedMedia {
   bytes: number
 }
 
-const INBOX_DIR = join(STATE_DIR, "inbox")
+export const INBOX_DIR = join(STATE_DIR, "inbox")
 
 /** Download and decrypt one inbound attachment. Never throws. */
 export async function downloadItem(params: {
@@ -71,23 +73,47 @@ export async function downloadItem(params: {
     const plain = descriptor.key ? decryptAesEcb(raw, descriptor.key) : raw
     if (!plain) return { note: `${descriptor.name}：解密失败` }
 
+    // A truncated body (portal page, NAT reset reported as EOF, hostile answer)
+    // must not be passed off silently as the user's real attachment. The file is
+    // still delivered — rejecting it would lose data if the declared size is
+    // ever wrong — but the mismatch is reported.
+    let sizeWarning: string | undefined
+    if (descriptor.declared) {
+      const actual = descriptor.declared.of === "cipher" ? raw.byteLength : plain.byteLength
+      const slack = descriptor.declared.of === "cipher" ? 16 : 0
+      if (Math.abs(actual - descriptor.declared.bytes) > slack) {
+        sizeWarning = `${descriptor.name}：大小与声明不符（服务端说 ${descriptor.declared.bytes} 字节，收到 ${actual}），可能被截断`
+      }
+    }
+
     mkdirSync(INBOX_DIR, { recursive: true })
-    const safe = descriptor.name.replace(/[<>:"/\\|?*\u0000-\u001f]/g, "_").slice(0, 120)
-    const path = join(INBOX_DIR, `${new Date().toISOString().replace(/[:.]/g, "-")}-${safe}`)
+    const path = join(INBOX_DIR, `${new Date().toISOString().replace(/[:.]/g, "-")}-${safeInboxName(descriptor.name)}`)
     // Private chat media: keep it as private as the credentials next to it.
     writeFileSync(path, plain, { mode: 0o600 })
     pruneInbox()
-    return { media: { path, name: descriptor.name, kind: descriptor.kind, bytes: plain.byteLength } }
+    return {
+      media: { path, name: descriptor.name, kind: descriptor.kind, bytes: plain.byteLength },
+      ...(sizeWarning === undefined ? {} : { note: sizeWarning }),
+    }
   } catch (error) {
     return { note: `${descriptor.name}：${error instanceof Error ? error.message : String(error)}` }
   }
 }
 
 function describe(item: MessageItem):
-  | { kind: DownloadedMedia["kind"]; name: string; ref?: MediaRef; key?: Buffer; expectsKey: boolean }
+  | {
+      kind: DownloadedMedia["kind"]
+      name: string
+      ref?: MediaRef
+      key?: Buffer
+      expectsKey: boolean
+      /** Size the server declared, so a truncated body is not passed off as the file. */
+      declared?: { bytes: number; of: "cipher" | "plain" }
+    }
   | undefined {
   if (item.type === ItemType.IMAGE && item.image_item?.media) {
     const media = item.image_item.media
+    const mid = item.image_item.mid_size
     return {
       kind: "image",
       name: `image-${short(item.msg_id ?? String(Date.now()))}.jpg`,
@@ -96,26 +122,32 @@ function describe(item: MessageItem):
       // stop us from trying the key carried by the media ref itself.
       key: decodeKey(item.image_item.aeskey) ?? decodeKey(media.aes_key),
       expectsKey: Boolean(item.image_item.aeskey?.trim() || media.aes_key?.trim()),
+      // `mid_size` is the ciphertext size, which is what we download.
+      ...(typeof mid === "number" && mid > 0 ? { declared: { bytes: mid, of: "cipher" as const } } : {}),
     }
   }
   if (item.type === ItemType.FILE && item.file_item?.media) {
     const media = item.file_item.media
+    const len = Number(item.file_item.len ?? "")
     return {
       kind: "file",
       name: item.file_item.file_name?.trim() || `file-${short(item.msg_id ?? String(Date.now()))}.bin`,
       ref: media,
       key: decodeKey(media.aes_key),
       expectsKey: Boolean(media.aes_key?.trim()),
+      ...(Number.isFinite(len) && len > 0 ? { declared: { bytes: len, of: "plain" as const } } : {}),
     }
   }
   if (item.type === ItemType.VIDEO && item.video_item?.media) {
     const media = item.video_item.media
+    const size = item.video_item.video_size
     return {
       kind: "video",
       name: `video-${short(item.msg_id ?? String(Date.now()))}.mp4`,
       ref: media,
       key: decodeKey(media.aes_key),
       expectsKey: Boolean(media.aes_key?.trim()),
+      ...(typeof size === "number" && size > 0 ? { declared: { bytes: size, of: "cipher" as const } } : {}),
     }
   }
   if (item.type === ItemType.VOICE && item.voice_item?.media) {
@@ -131,6 +163,21 @@ function describe(item: MessageItem):
   return undefined
 }function short(value: string): string {
   return createHash("sha1").update(value).digest("hex").slice(0, 8)
+}
+
+/**
+ * Make a server-supplied file name safe for the inbox.
+ *
+ * Separators and reserved characters are replaced (no traversal, no device
+ * names), the length is capped so the full path stays under MAX_PATH on
+ * Windows, and a trailing dot/space is stripped because Win32 silently drops
+ * those — the path we hand to the model would then not exist.
+ */
+export function safeInboxName(name: string): string {
+  const cleaned = name.replace(/[<>:"/\\|?*\u0000-\u001f]/g, "_").replace(/[. ]+$/g, "")
+  const points = [...cleaned]
+  const capped = points.length > 80 ? points.slice(0, 80).join("") : cleaned
+  return capped || "attachment"
 }
 
 /** One download must not hold the inbound pump forever. */
@@ -163,17 +210,26 @@ export async function fetchMedia(params: {
 }): Promise<Buffer | undefined> {
   const url = mediaUrl(params.ref)
   if (!url) return undefined
+  // The URL comes from a `getupdates` answer, i.e. from the network. On Bun
+  // `fetch("file://…")` reads local files, which would copy `state.json` (bot
+  // token included) into the inbox and hand it to the model.
+  if (!isTrustedUrl(url)) return undefined
   const maxBytes = params.maxBytes ?? MAX_DOWNLOAD_BYTES
 
   let response: Response
   try {
-    response = await fetch(url, { signal: withDeadline(params.signal, params.timeoutMs ?? DOWNLOAD_TIMEOUT_MS) })
+    response = await fetch(url, {
+      signal: withDeadline(params.signal, params.timeoutMs ?? DOWNLOAD_TIMEOUT_MS),
+      redirect: "follow",
+    })
   } catch {
     // A timeout or a dropped connection means "could not download", which the
     // caller turns into a note; it must not look like a crash.
     return undefined
   }
   if (!response.ok) return undefined
+  // A redirect may have left the trusted hosts — do not read that body.
+  if (response.url && !isTrustedUrl(response.url)) return undefined
 
   const declared = Number(response.headers.get("content-length") ?? "")
   if (Number.isFinite(declared) && declared > maxBytes) return undefined
@@ -181,6 +237,9 @@ export async function fetchMedia(params: {
   const reader = response.body?.getReader()
   if (!reader) {
     const buffer = Buffer.from(await response.arrayBuffer())
+    // An empty body is a failed download, not an empty attachment: writing it
+    // would hand the model a 0-byte file presented as the user's real one.
+    if (buffer.byteLength === 0) return undefined
     return buffer.byteLength > maxBytes ? undefined : buffer
   }
 
@@ -197,7 +256,8 @@ export async function fetchMedia(params: {
     }
     chunks.push(Buffer.from(value))
   }
-  return Buffer.concat(chunks)
+  const body = Buffer.concat(chunks)
+  return body.byteLength === 0 ? undefined : body
 }
 
 export function mediaUrl(ref?: MediaRef): string | undefined {
@@ -400,6 +460,24 @@ export async function prepareAttachment(params: {
     uploadParam: uploadParam ?? undefined,
     filekey,
     signal: params.signal,
+    // Retries ask for a fresh single-use URL instead of replaying a spent one.
+    renew: async () => {
+      const fresh = await getUploadUrl({
+        account: params.account,
+        filekey,
+        mediaType:
+          kind === "image" ? UploadMediaType.IMAGE : kind === "video" ? UploadMediaType.VIDEO : UploadMediaType.FILE,
+        toUserId: params.toUserId,
+        rawsize: plainSize,
+        rawfilemd5,
+        filesize: cipherSize,
+        aeskey: aesKey.toString("hex"),
+        signal: params.signal,
+      })
+      const full = fresh.upload_full_url?.trim()
+      if (full && isTrustedUrl(full)) return full
+      return uploadUrlFromParam(fresh.upload_param, filekey)
+    },
   })
 
   const uploaded: UploadedMedia = {
@@ -419,6 +497,24 @@ const UPLOAD_ATTEMPTS = 3
 /** One CDN upload attempt may take this long before it is aborted. */
 const UPLOAD_TIMEOUT_MS = 180_000
 
+/** Build the CDN upload URL from a single-use parameter. */
+function uploadUrlFromParam(param: string | undefined, filekey: string): string | undefined {
+  if (!param) return undefined
+  return `${CDN_BASE_URL}/upload?encrypted_query_param=${encodeURIComponent(param)}&filekey=${encodeURIComponent(filekey)}`
+}
+
+/**
+ * Make remote text safe to log and to forward: control characters stripped,
+ * credential shapes redacted, length capped. The caller marks the provenance,
+ * because a CDN error string is not something the bridge said.
+ */
+function sanitizeRemoteText(text: string, limit = 160): string {
+  return redactSecrets(text.replace(/[\u0000-\u001f\u007f]/g, " "))
+    .replace(/\s+/g, " ")
+    .trim()
+    .slice(0, limit)
+}
+
 /** POST the ciphertext and read back the download parameter. */
 async function uploadCiphertext(params: {
   buf: Buffer
@@ -427,13 +523,11 @@ async function uploadCiphertext(params: {
   uploadParam?: string
   filekey: string
   signal?: AbortSignal
+  /** Ask the service for a fresh URL — the parameter is single-use. */
+  renew?: () => Promise<string | undefined>
 }): Promise<string> {
   const ciphertext = encryptAesEcb(params.buf, params.aesKey)
-  const url =
-    params.uploadFullUrl ??
-    (params.uploadParam
-      ? `${CDN_BASE_URL}/upload?encrypted_query_param=${encodeURIComponent(params.uploadParam)}&filekey=${encodeURIComponent(params.filekey)}`
-      : undefined)
+  let url = params.uploadFullUrl ?? uploadUrlFromParam(params.uploadParam, params.filekey)
   if (!url) throw new Error("缺少 CDN 上传地址")
 
   let lastError: unknown
@@ -449,7 +543,7 @@ async function uploadCiphertext(params: {
       })
       if (response.status >= 400 && response.status < 500) {
         const detail = response.headers.get("x-error-message") ?? (await response.text()).slice(0, 200)
-        throw new Error(`CDN 拒绝上传 ${response.status}：${detail}`)
+        throw new Error(`CDN 拒绝上传 ${response.status}${detail ? `：远端返回 ${sanitizeRemoteText(detail)}` : ""}`)
       }
       if (response.status !== 200) throw new Error(`CDN 上传失败：HTTP ${response.status}`)
       const downloadParam = response.headers.get("x-encrypted-param") ?? undefined
@@ -461,7 +555,15 @@ async function uploadCiphertext(params: {
       if (error instanceof Error && error.message.startsWith("CDN 拒绝上传")) throw error
       // A cancelled upload must not be retried either.
       if (params.signal?.aborted) throw error
-      if (attempt < UPLOAD_ATTEMPTS) await new Promise((resolve) => setTimeout(resolve, 500 * attempt))
+      if (attempt < UPLOAD_ATTEMPTS) {
+        // The upload parameter is single-use, so a retry on the same URL often
+        // cannot succeed (the first attempt reached the CDN and was lost).
+        if (params.renew) {
+          const fresh = await params.renew().catch(() => undefined)
+          if (fresh) url = fresh
+        }
+        await new Promise((resolve) => setTimeout(resolve, 500 * attempt))
+      }
     }
   }
   throw lastError instanceof Error ? lastError : new Error("CDN 上传失败")

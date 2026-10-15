@@ -75,7 +75,7 @@ export function formatRelativeTime(timestamp?: number): string {
 
 /** Resolve a `/switch` argument against the list the user just saw. */
 export function resolveSessionTarget(sessions: ApiSession[], argument: string): ApiSession | undefined {
-  const value = argument.trim()
+  const value = argument.normalize("NFKC").trim()
   if (!value) return undefined
 
   const index = Number.parseInt(value, 10)
@@ -136,7 +136,7 @@ export function formatModelList(models: ModelSummary[], current?: { providerID: 
 }
 
 export function resolveModelTarget(models: ModelSummary[], argument: string): ModelSummary | undefined {
-  const value = argument.trim()
+  const value = argument.normalize("NFKC").trim()
   if (!value) return undefined
   // Numbering, listing and lookup share one filtered list — and the same display
   // cap — so an index nobody could have read off the list is not accepted.
@@ -171,7 +171,7 @@ export function formatAgentList(agents: AgentSummary[], current?: string): strin
 }
 
 export function resolveAgentTarget(agents: AgentSummary[], argument: string): AgentSummary | undefined {
-  const value = argument.trim()
+  const value = argument.normalize("NFKC").trim()
   if (!value) return undefined
   // The same filtered list backs numbering, listing and lookup: `/agent helper`
   // must not switch to an agent the list deliberately hides.

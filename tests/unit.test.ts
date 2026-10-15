@@ -30,12 +30,28 @@ import {
   parseWireJson,
   newClientId,
   assertSendAccepted,
+  assertTrustedUrl,
+  isTrustedUrl,
+  redactSecrets,
   sendText,
   sleep,
+  toCode,
   SendRefusedError,
 } from "../ilink.ts"
-import { MAX_DOWNLOAD_BYTES, fetchMedia, pruneInbox } from "../media.ts"
-import { LOCK_PATH, STATE_DIR, STATE_PATH, acquireLock, ensureStateDir, pruneStaleTemps, readState } from "../state.ts"
+import { INBOX_DIR, MAX_DOWNLOAD_BYTES, fetchMedia, pruneInbox, safeInboxName } from "../media.ts"
+import {
+  LOCK_PATH,
+  QR_PNG_PATH,
+  STATE_DIR,
+  STATE_PATH,
+  acquireLock,
+  acquireLoginLock,
+  ensureStateDir,
+  pruneQrPng,
+  pruneStaleTemps,
+  readState,
+  removeQrPng,
+} from "../state.ts"
 import { randomBytes } from "node:crypto"
 import { existsSync, mkdirSync, rmSync, utimesSync, writeFileSync } from "node:fs"
 import { join } from "node:path"
@@ -640,5 +656,125 @@ describe("network watchdog", () => {
     const closeable = server as unknown as { closeAllConnections?: () => void }
     closeable.closeAllConnections?.()
     server.close()
+  })
+})
+
+describe("wire hygiene", () => {
+  test("error codes are compared by value, not by type", () => {
+    // The gateway has been seen sending codes as strings; `"0" !== 0` used to
+    // turn an accepted send into a refusal and retry a dead token forever.
+    expect(toCode(0)).toBe(0)
+    expect(toCode("0")).toBe(0)
+    expect(toCode(-14)).toBe(-14)
+    expect(toCode("-14")).toBe(-14)
+    expect(toCode(" -2 ")).toBe(-2)
+    expect(toCode(undefined)).toBeUndefined()
+    expect(toCode(null)).toBeUndefined()
+    expect(toCode("nope")).toBeUndefined()
+
+    expect(() => assertSendAccepted({ ret: "0" } as never)).not.toThrow()
+    expect(() => assertSendAccepted({ ret: "-14" } as never)).toThrow(SendRefusedError)
+    const refused = (() => {
+      try {
+        assertSendAccepted({ errcode: "0" } as never)
+        return undefined
+      } catch (error) {
+        return error
+      }
+    })()
+    expect(refused).toBeUndefined()
+  })
+
+  test("parseWireJson preserves uint64 ids and never rewrites message text", () => {
+    const raw = '{"message_id":7514975623787282440,"msg_id":123456789012345678901,"text":"ok"}'
+    const parsed = parseWireJson<{ message_id: string; msg_id: string; text: string }>(raw)
+    expect(parsed.message_id).toBe("7514975623787282440")
+    expect(parsed.msg_id).toBe("123456789012345678901")
+
+    // The old global replace also hit string *values*: a message that happens to
+    // contain the pattern came out subtly altered.
+    const tricky = '{"text":"he said \\"msg_id\\": 123456789 and left","msg_id":7514975623787282440}'
+    const parsedTricky = parseWireJson<{ text: string; msg_id: string }>(tricky)
+    expect(parsedTricky.text).toBe('he said "msg_id": 123456789 and left')
+    expect(parsedTricky.msg_id).toBe("7514975623787282440")
+
+    // A key whose value is already a string stays untouched.
+    expect(parseWireJson<{ msg_id: string }>('{"msg_id":"123"}').msg_id).toBe("123")
+  })
+
+  test("only https to trusted WeChat hosts (or loopback) may be fetched", () => {
+    expect(isTrustedUrl("https://ilinkai.weixin.qq.com/ilink/bot/sendmessage")).toBe(true)
+    expect(isTrustedUrl("https://novac2c.cdn.weixin.qq.com/download?x=1")).toBe(true)
+    expect(isTrustedUrl("http://127.0.0.1:8080/download")).toBe(true)
+    expect(isTrustedUrl("http://localhost:8080/download")).toBe(true)
+
+    // The two that motivated this check.
+    expect(isTrustedUrl("file:///C:/Users/qin/.config/opencode/wechat/state.json")).toBe(false)
+    expect(isTrustedUrl("https://attacker.example/steal")).toBe(false)
+    expect(isTrustedUrl("http://ilinkai.weixin.qq.com/downgrade")).toBe(false)
+    expect(isTrustedUrl("https://weixin.qq.com.evil.example/steal")).toBe(false)
+    expect(isTrustedUrl("not a url")).toBe(false)
+    expect(() => assertTrustedUrl("file:///etc/passwd", "媒体")).toThrow(/https/)
+  })
+
+  test("redactSecrets strips credential shapes but keeps readable text", () => {
+    expect(redactSecrets("Bearer abcdef123456")).not.toContain("abcdef123456")
+    expect(redactSecrets('{"bot_token":"abcdef123456","x":1}')).not.toContain("abcdef123456")
+    expect(redactSecrets(`token=${"a".repeat(50)}`)).not.toContain("a".repeat(50))
+    // Long opaque runs (a pasted key) are hidden too.
+    expect(redactSecrets(`我的密钥是 ${"Z".repeat(48)} 请记下`)).not.toContain("Z".repeat(48))
+    // Ordinary short text survives.
+    expect(redactSecrets("普通消息，没问题")).toBe("普通消息，没问题")
+    expect(redactSecrets("https://example.com/a/b")).toBe("https://example.com/a/b")
+  })
+
+  test("only one login flow may run at a time, and a stale lock is taken over", () => {
+    const release = acquireLoginLock()
+    expect(release).toBeFunction()
+    // The CLI and the TUI command can be started at once; the second one must
+    // refuse instead of racing for the same state file.
+    expect(acquireLoginLock()).toBeUndefined()
+    release?.()
+    const second = acquireLoginLock()
+    expect(second).toBeFunction()
+    second?.()
+
+    // An abandoned flow (killed process) must not block logins forever.
+    const lockPath = join(STATE_DIR, "login.lock")
+    writeFileSync(lockPath, JSON.stringify({ pid: process.pid, at: Date.now() - 10 * 60_000 }))
+    const third = acquireLoginLock()
+    expect(third).toBeFunction()
+    third?.()
+    rmSync(lockPath, { force: true })
+  })
+
+  test("an abandoned login QR image is deleted, a fresh one is kept", () => {
+    writeFileSync(QR_PNG_PATH, "png")
+    expect(pruneQrPng()).toBe(false)
+    const old = Date.now() - 2 * 60 * 60_000
+    utimesSync(QR_PNG_PATH, new Date(old), new Date(old))
+    expect(pruneQrPng()).toBe(true)
+    expect(existsSync(QR_PNG_PATH)).toBe(false)
+
+    writeFileSync(QR_PNG_PATH, "png")
+    removeQrPng()
+    expect(existsSync(QR_PNG_PATH)).toBe(false)
+  })
+
+  test("inbox names cannot traverse, end in a dot, or split a surrogate pair", () => {
+    // Separators are replaced, so the result can never leave the inbox directory
+    // even when the name arrives as `../../etc/passwd`.
+    const traversal = safeInboxName("../../etc/passwd")
+    expect(traversal).not.toContain("/")
+    expect(traversal).not.toContain("\\")
+    expect(join(INBOX_DIR, traversal).startsWith(INBOX_DIR)).toBe(true)
+    expect(safeInboxName("a/b\\c:d*e?f")).toBe("a_b_c_d_e_f")
+    expect(safeInboxName("report.pdf. ")).toBe("report.pdf")
+    expect(safeInboxName("")).toBe("attachment")
+    const long = `${"字".repeat(200)}.pdf`
+    const capped = safeInboxName(long)
+    expect([...capped].length).toBeLessThanOrEqual(80)
+    // No lone surrogate left behind by the cut.
+    expect(capped).toBe([...capped].join(""))
   })
 })
