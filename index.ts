@@ -641,3 +641,4 @@ async function renderQr(payload: string): Promise<string | undefined> {
 
 
 
+

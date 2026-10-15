@@ -75,7 +75,7 @@ async function main(): Promise<void> {
   }
   line("进度提示", config.progress === "tools" ? "显示工具调用" : "关闭")
   line("实时推送", config.stream === "live" ? `开（${config.streamIntervalMs / 1000}s）` : "关")
-  line("回复延迟", `${config.turnGraceMs}ms（文本结束到发送的最长等待）`)
+  line("回复延迟", `信号后 ${config.turnSettleMs}ms；无信号时最多 ${config.turnGraceMs}ms`)
   line("白名单", config.allowedUsers.length ? config.allowedUsers.join(", ") : "仅绑定用户")
   line("新会话模型", config.model || "跟随默认")
   line("新会话 agent", config.agent || "跟随默认")
