@@ -141,6 +141,20 @@ async function main(): Promise<void> {
       draft.account = undefined
       draft.previousTokens = []
       draft.syncBuf = undefined
+      // Purge means the home directory is truly reset: leftover bindings,
+      // queued replies and remembered state would otherwise resurrect sessions
+      // (and replay outbound text) the user asked to forget.
+      draft.bindings = {}
+      draft.contextTokens = {}
+      draft.channelSessionID = undefined
+      draft.phoneSessions = []
+      draft.pendingQuestions = {}
+      draft.questionAnswers = {}
+      draft.pendingOutbound = {}
+      draft.pendingOutboundSince = {}
+      draft.pendingOutboundAttempts = {}
+      draft.lastConversation = undefined
+      draft.seenMessages = []
     })
     removeQrPng()
     console.log("已彻底清除本地凭据与旧 token；下次扫码会创建新的绑定。")

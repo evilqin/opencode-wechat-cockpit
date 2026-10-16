@@ -35,7 +35,11 @@ export function formatFormPrompt(form: PendingForm, queuePosition: number, queue
   const lines = [`❓ opencode 想问你${form.title ? `：${shorten(form.title, 60)}` : ""}`]
   if (queueLength > 1) lines.push(`（第 ${queuePosition}/${queueLength} 个待回答）`)
 
-  const shown = form.fields.slice(0, MAX_FIELDS_SHOWN)
+  // Hidden fields carry a preset answer the service fills in itself; offering
+  // one asks the user a question they cannot meaningfully answer, and a hidden
+  // *required* field would otherwise block the form forever.
+  const visible = form.fields.filter((field) => field.hidden !== true)
+  const shown = visible.slice(0, MAX_FIELDS_SHOWN)
   for (const [index, field] of shown.entries()) {
     const kind =
       field.type === "boolean"
@@ -50,7 +54,7 @@ export function formatFormPrompt(form: PendingForm, queuePosition: number, queue
       lines.push(`   · ${shorten(option.label ?? option.value, 60)}${detail}`)
     }
   }
-  if (form.fields.length > shown.length) lines.push(`…还有 ${form.fields.length - shown.length} 个问题未显示`)
+  if (visible.length > shown.length) lines.push(`…还有 ${visible.length - shown.length} 个问题未显示`)
 
   const multi = shown.length > 1
   lines.push(
@@ -80,7 +84,9 @@ export interface ResolvedAnswer {
  *                                 what a Chinese keyboard produces by default
  */
 export function resolveAnswer(form: PendingForm, input: string): ResolvedAnswer | { error: string } {
-  const fields = form.fields
+  // Numbering and conversion must use the same list, so drop hidden fields here
+  // too — otherwise `/answer 1=…` would target a different question than shown.
+  const fields = form.fields.filter((field) => field.hidden !== true)
   if (fields.length === 0) return { error: "这个表单没有可回答的问题" }
 
   const trimmed = input.trim()
@@ -131,7 +137,7 @@ export function resolveAnswer(form: PendingForm, input: string): ResolvedAnswer 
 /** Questions that must be answered but were not. */
 export function missingRequired(fields: ApiFormField[], answer: Record<string, unknown>): string[] {
   return fields
-    .filter((field) => field.required === true && field.type !== "external")
+    .filter((field) => field.required === true && field.type !== "external" && field.hidden !== true)
     .filter((field) => {
       const value = answer[field.key]
       if (value === undefined || value === null) return true

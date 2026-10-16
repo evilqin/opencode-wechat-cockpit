@@ -122,6 +122,8 @@ export class LocalApi {
   readonly #file?: string
   #registration?: Registration
   #readAt = 0
+  /** When the "no registration" result expires; avoids a read per call. */
+  #missingUntil = 0
 
   constructor(options: LocalApiOptions = {}) {
     this.#cacheMs = options.cacheMs ?? 20_000
@@ -143,6 +145,9 @@ export class LocalApi {
   #read(): Registration | undefined {
     const now = Date.now()
     if (this.#registration && now - this.#readAt < this.#cacheMs) return this.#registration
+    // A missing registration used to be re-read (a disk hit) on every call; a
+    // caller that polls — the health report, a session tick — must stay cheap.
+    if (now < this.#missingUntil) return undefined
     const candidates = this.#file ? [this.#file] : registrationPaths()
     for (const path of candidates) {
       try {
@@ -150,6 +155,7 @@ export class LocalApi {
         if (typeof parsed?.url === "string" && typeof parsed.pid === "number") {
           this.#registration = parsed
           this.#readAt = now
+          this.#missingUntil = 0
           return parsed
         }
       } catch {
@@ -158,6 +164,7 @@ export class LocalApi {
     }
     this.#registration = undefined
     this.#readAt = now
+    this.#missingUntil = now + this.#cacheMs
     return undefined
   }
 
@@ -165,6 +172,7 @@ export class LocalApi {
   invalidate(): void {
     this.#registration = undefined
     this.#readAt = 0
+    this.#missingUntil = 0
   }
 
   /**

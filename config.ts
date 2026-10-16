@@ -8,7 +8,7 @@
  * effect within a few seconds without a restart.
  */
 
-import { existsSync, readFileSync } from "node:fs"
+import { readFileSync } from "node:fs"
 import { homedir } from "node:os"
 import { join } from "node:path"
 import { writePrivate, ensureStateDir, STATE_DIR } from "./state.ts"
@@ -167,12 +167,27 @@ export function normalizeConfig(input: Partial<WechatConfig> | undefined): Wecha
   }
 }
 
+/**
+ * The last config that was read successfully.
+ *
+ * A read can fail for reasons unrelated to "no settings yet" — a transient
+ * AV/sync lock, EACCES while another instance rewrites the file. Falling back
+ * to DEFAULT_CONFIG there would silently reset the user's settings on the next
+ * ownership tick, so a last-good copy is kept and returned instead.
+ */
+let lastGoodConfig: WechatConfig | undefined
+
 export function readConfig(): WechatConfig {
   try {
-    if (!existsSync(CONFIG_PATH)) return { ...DEFAULT_CONFIG }
-    return normalizeConfig(JSON.parse(readFileSync(CONFIG_PATH, "utf8")) as Partial<WechatConfig>)
-  } catch {
-    return { ...DEFAULT_CONFIG }
+    const config = normalizeConfig(JSON.parse(readFileSync(CONFIG_PATH, "utf8")) as Partial<WechatConfig>)
+    lastGoodConfig = config
+    return config
+  } catch (error) {
+    const code = (error as NodeJS.ErrnoException).code
+    // A missing file really is "no settings yet".
+    if (code === "ENOENT") return { ...DEFAULT_CONFIG }
+    // Any other failure is transient: prefer what we already know.
+    return lastGoodConfig ?? { ...DEFAULT_CONFIG }
   }
 }
 

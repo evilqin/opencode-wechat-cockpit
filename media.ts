@@ -190,7 +190,19 @@ function withDeadline(signal: AbortSignal | undefined, ms: number): AbortSignal 
   const anySignals = (AbortSignal as unknown as { any?: (signals: AbortSignal[]) => AbortSignal }).any
   const timeout = (AbortSignal as unknown as { timeout?: (ms: number) => AbortSignal }).timeout
   const deadline = timeout ? timeout(ms) : undefined
-  if (signal && deadline && anySignals) return anySignals([signal, deadline])
+  if (signal && deadline) {
+    if (anySignals) return anySignals([signal, deadline])
+    // `timeout` without `any` (older runtimes) used to fall through and return
+    // the deadline alone, silently dropping the caller's cancellation — a
+    // shutdown could no longer stop the download. Relay both by hand.
+    const controller = new AbortController()
+    const relay = (): void => controller.abort()
+    signal.addEventListener("abort", relay, { once: true })
+    deadline.addEventListener("abort", relay, { once: true })
+    // Already-aborted inputs never fire the listener, so abort now.
+    if (signal.aborted || deadline.aborted) controller.abort()
+    return controller.signal
+  }
   if (deadline) return deadline
   if (signal) return signal
   const controller = new AbortController()

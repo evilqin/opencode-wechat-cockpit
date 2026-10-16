@@ -24,6 +24,17 @@ function line(label: string, value: string): void {
   console.log(`${label.padEnd(14, " ")} ${value}`)
 }
 
+/** Whether the lock's owner process is gone (EPERM still means it exists). */
+function isDeadPid(pid: number): boolean {
+  if (!Number.isFinite(pid) || pid <= 0) return true
+  try {
+    process.kill(pid, 0)
+    return false
+  } catch (error) {
+    return (error as NodeJS.ErrnoException).code !== "EPERM"
+  }
+}
+
 async function main(): Promise<void> {
   console.log("opencode 微信通道自检\n")
 
@@ -102,6 +113,7 @@ async function main(): Promise<void> {
 
   /* ---- lock ---- */
   let noLock = false
+  let staleLock = false
   if (existsSync(LOCK_PATH)) {
     try {
       const lock = JSON.parse(readFileSync(LOCK_PATH, "utf8")) as {
@@ -129,7 +141,7 @@ async function main(): Promise<void> {
           timeouts > 0 ? `，连续 ${timeouts} 次无应答` : ""
         }）`,
       )
-      if (ageSeconds > 120) notes.push("轮询锁看起来已经过期，下次 tick（10 秒内）会被自动接管")
+      if (ageSeconds > 120 || isDeadPid(lock.pid)) staleLock = true
       if (timeouts >= 3 || (answerAge !== undefined && answerAge > 120)) {
         notes.push("连续多次长轮询没有应答：网络可能在丢包（门户认证掉了？），看 bridge.log 的 poll 日志")
       } else if (pollAge !== undefined && pollAge > 120) {
@@ -153,12 +165,20 @@ async function main(): Promise<void> {
       // The service is alive but no instance holds the lock: the plugin is not
       // loaded, which is exactly the "channel went deaf" incident.
       problems.push("opencode 服务在跑，却没有任何实例持有轮询锁：插件没有加载（看服务日志里的 plugin 报错）")
+    } else if (staleLock) {
+      // A live instance takes a stale lock over within 10 s, so one still held
+      // by a stale heartbeat (or a dead pid) minutes later means the plugin is
+      // stuck — the channel is deaf even though the service is up.
+      problems.push("轮询锁已过期（心跳落后，或持有它的进程已退出）却一直没被接管：插件可能卡住了，看 bridge.log 的 poll 日志")
     }
     const sessions = await api.listSessions({ limit: 3 })
     line("会话可见", `最近 ${sessions.length} 个（/list 用得到）`)
     notes.push("自检是独立进程，所以永远不是「本进程」；插件在 opencode 服务里运行时会自己认出来")
   } else {
     line("本地 API", "不可用")
+    // Without a reachable service the lock may simply belong to a stopped
+    // opencode, so this stays a note rather than a problem.
+    if (staleLock) notes.push("轮询锁看起来已经过期，下次 tick（10 秒内）会被自动接管")
     notes.push("本地 API 不可用时：/list 只列微信建过的会话，agent 的提问需要回电脑回答")
     notes.push("opencode 服务没在运行时，微信消息会留在腾讯服务端，等它重连后按游标补发")
   }

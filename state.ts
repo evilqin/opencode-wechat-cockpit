@@ -33,6 +33,16 @@ export const LOCK_PATH = join(STATE_DIR, "lock.json")
 /** How long a lock may go without a heartbeat before another instance takes over. */
 export const LOCK_STALE_MS = 60_000
 
+/**
+ * How far a heartbeat (or login-lock timestamp) may sit in the future.
+ *
+ * Two processes can disagree by a little, and a machine whose clock jumped can
+ * put a heartbeat ahead of `now`. Without an allowance, `now - heartbeat` is
+ * negative, the lock reads as "fresh forever", and it can never be taken over
+ * (and a stale login lock never expires).
+ */
+const LOCK_SKEW_MS = 60_000
+
 export interface SessionBinding {
   sessionID: string
   directory: string
@@ -344,7 +354,9 @@ export function acquireLoginLock(ttlMs: number = 2 * 60_000): (() => void) | und
   if (!claim()) {
     try {
       const info = JSON.parse(readFileSync(path, "utf8")) as { at?: number }
-      if (typeof info.at === "number" && Date.now() - info.at < ttlMs) return undefined
+      // A timestamp in the future (clock skew / a jumped clock) must not keep
+      // the lock alive forever; treat it as stale and replace it below.
+      if (typeof info.at === "number" && Date.now() - info.at < ttlMs && !isFutureTimestamp(info.at)) return undefined
     } catch {
       // Unreadable lock: fall through and replace it.
     }
@@ -456,11 +468,15 @@ export function acquireLock(location: string): LockHandle | undefined {
 
   if (!claimExclusively(info)) {
     const current = readLock()
-    const pollingAlive = current?.polledAt !== undefined && Date.now() - current.polledAt < LOCK_POLL_STALE_MS
+    const pollingAlive =
+      current?.polledAt !== undefined &&
+      !isFutureTimestamp(current.polledAt) &&
+      Date.now() - current.polledAt < LOCK_POLL_STALE_MS
     // A fresh heartbeat with no recent poll means the owner is wedged: stealable.
     const foreignLiveLock = Boolean(
       current &&
         Date.now() - current.heartbeat < LOCK_STALE_MS &&
+        !isFutureTimestamp(current.heartbeat) &&
         !isDeadProcess(current.pid) &&
         (current.polledAt === undefined || pollingAlive),
     )
@@ -557,6 +573,8 @@ export function lockOwnerInstanceId(): string | undefined {
   const current = readLock()
   if (!current) return undefined
   if (Date.now() - current.heartbeat >= LOCK_STALE_MS) return undefined
+  // A future heartbeat must count as stale, or it would look live forever.
+  if (isFutureTimestamp(current.heartbeat)) return undefined
   if (isDeadProcess(current.pid)) return undefined
   return current.instanceId
 }
@@ -568,6 +586,11 @@ function readLock(): LockInfo | undefined {
   } catch {
     return undefined
   }
+}
+
+/** Whether a timestamp is ahead of now beyond the allowed clock skew. */
+function isFutureTimestamp(at: number, now: number = Date.now()): boolean {
+  return at - now > LOCK_SKEW_MS
 }
 
 function isDeadProcess(pid: number): boolean {

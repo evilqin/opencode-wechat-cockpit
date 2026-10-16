@@ -2347,4 +2347,17 @@ describe("hardening (audit follow-up)", () => {
     await waitFor(() => sentTexts().some((text) => text.includes("🔧 bash")), 2_000, "tool progress line")
     expect(sentTexts().join("\n")).not.toContain("task_complete")
   })
+
+  test("the bridge's own tools are not mirrored as 🔧 lines either", async () => {
+    const { bridge } = await harness()
+    await bridge.handleInbound(inbound("/new 我的会话"))
+    clearSent()
+    await bridge.handleEvent({ type: "session.tool.called", data: { id: "wechat_send", sessionID: "ses_test1" } })
+    await bridge.handleEvent({
+      type: "session.tool.called",
+      data: { id: "bash", input: { command: "ls" }, sessionID: "ses_test1" },
+    })
+    await waitFor(() => sentTexts().some((text) => text.includes("🔧 bash")), 2_000, "tool progress line")
+    expect(sentTexts().join("\n")).not.toContain("wechat_send")
+  })
 })
