@@ -18,7 +18,7 @@ import { afterAll, beforeAll, beforeEach, describe, expect, test } from "bun:tes
 import { createServer, type IncomingMessage, type Server } from "node:http"
 import { mkdtempSync, rmSync, writeFileSync } from "node:fs"
 import { tmpdir } from "node:os"
-import { join } from "node:path"
+import { join, resolve } from "node:path"
 
 import { Bridge } from "../bridge.ts"
 import { LocalApi } from "../api.ts"
@@ -628,7 +628,9 @@ describe("commands", () => {
 
     clearSent()
     await bridge.handleInbound(inbound(`/new ${TEST_STATE_DIR}`))
-    expect(calls.creates[1].location).toEqual({ directory: TEST_STATE_DIR })
+    // The bridge normalizes the directory (`path.resolve`), and CI's env var is
+    // a mixed-separator path on Windows: compare against the normalized form.
+    expect(calls.creates[1].location).toEqual({ directory: resolve(TEST_STATE_DIR) })
     expect(sentTexts()[0]).toContain("新会话已就绪")
   })
 
@@ -815,7 +817,8 @@ describe("commands", () => {
     clearSent()
     await bridge.handleInbound(inbound(`/dir ${TEST_STATE_DIR}`))
     expect(sentTexts()[0]).toContain("默认目录已设为")
-    expect(readState().defaultDirectory).toBe(TEST_STATE_DIR)
+    // Normalized by the bridge (`path.resolve`); see the /new test above.
+    expect(readState().defaultDirectory).toBe(resolve(TEST_STATE_DIR))
   })
 
   test("/status, /whoami, /ping and /log answer without the agent", async () => {
