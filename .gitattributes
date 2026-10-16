@@ -1,2 +1,5 @@
 # 仓库内统一 LF，检出时按平台自动转换
 * text=auto
+# Generated and byte-diffed by CI: force LF on every platform, or
+# Windows autocrlf rewrites the whole file and the sync check fails.
+MANUAL.md text eol=lf
