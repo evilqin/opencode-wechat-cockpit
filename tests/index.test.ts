@@ -24,7 +24,7 @@ const wechatPlugin = (await import("../index.ts")).default as unknown as {
   id: string
   setup: (ctx: never) => Promise<() => void>
 }
-const { createOwnershipLoop } = await import("../index.ts")
+const { createOwnershipLoop, startProgressKeepAlive } = await import("../index.ts")
 
 interface FakeStream extends AsyncIterator<unknown> {
   push: (event: unknown) => void
@@ -239,5 +239,39 @@ describe("plugin entry", () => {
     expect(existsSync(LOCK_PATH)).toBe(true)
     dispose()
     await waitFor(() => !existsSync(LOCK_PATH), 2_000, "lock release")
+  })
+})
+
+describe("progress keep-alive", () => {
+  test("beats immediately, keeps beating, and stops on request", async () => {
+    const beats: Array<Readonly<Record<string, unknown>>> = []
+    const stop = startProgressKeepAlive(
+      async (update) => {
+        beats.push(update)
+      },
+      25,
+      { title: "测试" },
+    )
+    // The first beat is immediate: a slow first interval would leave a gap the
+    // very stall watchdog this guards against could trip over.
+    expect(beats.length).toBe(1)
+
+    await waitFor(() => beats.length >= 3, 2_000, "keep-alive beats")
+    stop()
+    const seen = beats.length
+    await new Promise((resolve) => setTimeout(resolve, 60))
+    expect(beats.length).toBe(seen)
+  })
+
+  test("a missing or failing progress channel is harmless", async () => {
+    expect(() => startProgressKeepAlive(undefined)).not.toThrow()
+
+    let failures = 0
+    const stop = startProgressKeepAlive(async () => {
+      failures += 1
+      throw new Error("progress unavailable")
+    }, 25)
+    await waitFor(() => failures >= 2, 2_000, "failing beats")
+    stop()
   })
 })

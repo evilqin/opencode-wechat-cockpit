@@ -34,7 +34,7 @@ opencode **主动向外长轮询**腾讯 iLink 网关，所以电脑开着、ope
 | 🔁 **半截回答也能收全** | 多段回答自带编号 `（1/3）…`，被限流时入队并自动补发；`/more`（`/继续`）区分两种情况：**有卡住的就补发（不叫模型），确实没写完才让模型接着写** |
 | 🔁 **重复消息不花钱** | `message_id` 去重（最近 200 条），重复投递直接忽略，不会重复调用模型 |
 | 📚 **手机上就能查手册** | `/help` 总览、`/help 命令` 单条、`/help 全部` 全文；`MANUAL.md` 与代码同源自动生成；`/list` 支持翻页 |
-| 🧪 **有测试套件** | 202 个自动化测试（单元 + mock iLink 协议 + 假 ctx 行为测试）+ strict 类型检查（含 `noUnusedLocals`），真机验证记录见文末 |
+| 🧪 **有测试套件** | 205 个自动化测试（单元 + mock iLink 协议 + 假 ctx 行为测试）+ strict 类型检查（含 `noUnusedLocals`），真机验证记录见文末 |
 
 
 ## 最快上手
@@ -287,6 +287,18 @@ bun ...login-cli.ts --force    # 已登录时强制重新扫码
 `~/.local/state/opencode/service.json`（`$XDG_STATE_HOME` 优先，`WECHAT_SERVICE_FILE` 可覆盖）
 里的地址与密码，用 HTTP Basic 调用本机 opencode API。
 
+## 与其它插件共存
+
+同一台机器上装多个 opencode 插件是常态，这个插件专门做了几件事避免互相干扰：
+
+- **单轮询器锁**：无论打开多少个项目窗口（每个都会加载一份插件实例），同一时刻只有一个实例在轮询微信；持有者卡死 2 分钟内会被其它实例自动接管。
+- **提问等待不会被"假死恢复"打断**：`wechat_ask` 等待人工回答期间，每 60 秒上报一次工具进度（`session.tool.progress`），装了多少"会话卡住就自动 continue"的恢复类插件都不会把等待误判成挂起。
+- **`/cancel` 与自动续跑语义一致**：取消后不会被自动恢复插件重新拉起，直到你再次发言。
+- **不吃别人的工具**：`🔧` 进度只播报真正的干活工具，别的插件的簿记工具（如 `task_complete`）不会出现在微信里。
+- **状态文件各用各的**：插件只写 `~/.config/opencode/wechat/`（以及读取 opencode 自己的 service.json），与其它插件的存储、日志、命令、工具命名均不重叠。
+
+实测共存过的插件：oh-my-opencode-slim、@tarquinen/opencode-dcp、opencode-i18n-v2、auto-resume-v2（本地）。如果你发现新的冲突，日志 `bridge.log` 里搜 `event type seen for the first time` 通常能找到线索。
+
 ## 排查
 
 ```powershell
@@ -316,7 +328,7 @@ bun $env:USERPROFILE\.config\opencode\plugins\wechat\verify.ts
 ```powershell
 cd $env:USERPROFILE\.config\opencode\plugins\wechat
 cd types; bun install    # 一次性：类型检查用的官方类型（types/ 被 gitignore）
-bun test                 # 202 个测试：单元 + mock iLink + 假 ctx 驱动的 Bridge 行为
+bun test                 # 205 个测试：单元 + mock iLink + 假 ctx 驱动的 Bridge 行为
 bun run typecheck        # strict 检查（缺依赖时会提示上面那句安装命令）
 bun verify.ts            # 环境自检
 bun gen-manual.ts        # 改了 manual.ts 之后重新生成 MANUAL.md

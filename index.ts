@@ -130,6 +130,41 @@ function truncateIfLarge(path: string): void {
   }
 }
 
+/** How often a long human wait reports tool progress (see `startProgressKeepAlive`). */
+const ASK_PROGRESS_MS = 60_000
+
+/**
+ * Report tool progress on a timer while waiting for a human.
+ *
+ * The host turns `progress()` into `session.tool.progress` events, and plugins
+ * that watch for stalled sessions (auto-resume: a session quiet for 3 minutes
+ * is treated as hung) count those events as activity. Without this, every
+ * `wechat_ask` looks like a hung session and gets a "continue" injected into
+ * it, which derails the wait.
+ *
+ * Returns a stop function. A failing progress channel is swallowed on purpose:
+ * keep-alive is best effort, the answer itself is not.
+ */
+export function startProgressKeepAlive(
+  progress: ((update: Readonly<Record<string, unknown>>) => Promise<void>) | undefined,
+  intervalMs = ASK_PROGRESS_MS,
+  update: Readonly<Record<string, unknown>> = { title: "等待微信用户回答" },
+): () => void {
+  if (!progress) return () => undefined
+  let stopped = false
+  const beat = (): void => {
+    if (stopped) return
+    void progress(update).catch(() => undefined)
+  }
+  beat()
+  const timer = setInterval(beat, intervalMs)
+  timer.unref?.()
+  return () => {
+    stopped = true
+    clearInterval(timer)
+  }
+}
+
 export default Plugin.define({
   id: "wechat",
   async setup(ctx: Ctx) {
@@ -274,7 +309,10 @@ async function registerTools(ctx: Ctx, bridge: Bridge, log: { warn: (message: st
         required: ["question"],
         additionalProperties: false,
       },
-      execute: async (input: unknown) => {
+      execute: async (
+        input: unknown,
+        context?: { progress?: (update: Readonly<Record<string, unknown>>) => Promise<void> },
+      ) => {
         const record = (input ?? {}) as { question?: string; timeoutMinutes?: number }
         const question = String(record.question ?? "").trim()
         if (!question) return { content: "缺少 question" }
@@ -288,8 +326,15 @@ async function registerTools(ctx: Ctx, bridge: Bridge, log: { warn: (message: st
           typeof record.timeoutMinutes === "number" && record.timeoutMinutes > 0
             ? record.timeoutMinutes * 60_000
             : bridge.config.askTimeoutMs
-        const answer = await bridge.ask(conversationId, question, timeoutMs)
-        return { content: `用户的回答：${answer}` }
+        // A human can take minutes to answer; keep the session's activity clock
+        // alive so stall-recovery plugins do not inject a "continue" into the wait.
+        const stopKeepAlive = startProgressKeepAlive(context?.progress)
+        try {
+          const answer = await bridge.ask(conversationId, question, timeoutMs)
+          return { content: `用户的回答：${answer}` }
+        } finally {
+          stopKeepAlive()
+        }
       },
     })
 

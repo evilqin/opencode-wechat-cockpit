@@ -2332,4 +2332,17 @@ describe("hardening (audit follow-up)", () => {
     const result = await bridge.sendFileToLast({ filePath: join(tmpdir(), "wechat-definitely-missing.bin") })
     expect(result).toContain("文件不存在")
   })
+
+  test("another plugin's bookkeeping tool is not mirrored as a 🔧 line", async () => {
+    const { bridge } = await harness()
+    await bridge.handleInbound(inbound("/new 我的会话"))
+    clearSent()
+    await bridge.handleEvent({ type: "session.tool.called", data: { id: "task_complete", sessionID: "ses_test1" } })
+    await bridge.handleEvent({
+      type: "session.tool.called",
+      data: { id: "bash", input: { command: "ls" }, sessionID: "ses_test1" },
+    })
+    await waitFor(() => sentTexts().some((text) => text.includes("🔧 bash")), 2_000, "tool progress line")
+    expect(sentTexts().join("\n")).not.toContain("task_complete")
+  })
 })

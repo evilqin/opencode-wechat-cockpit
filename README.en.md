@@ -40,7 +40,7 @@ is built for "**you are away, the computer is working**":
 | 🔁 **Half an answer is still recoverable** | Multi-part replies are numbered `（1/3）…`; rate-limited parts are queued and re-sent automatically; `/more` (`/继续`) tells the two cases apart — **stuck text is re-sent without calling the model, only a genuinely unfinished answer asks it to continue** |
 | 🔁 **Duplicates cost nothing** | `message_id` dedup (last 200) so a redelivered message never triggers a second model call. |
 | 📚 **Manual on your phone** | `/help` for the overview, `/help attach` for one command, `/help 全部` for the full manual; `MANUAL.md` is generated from the same source as the bot's answers; `/list` supports paging. |
-| 🧪 **Tested** | 202 automated tests (unit + mock-iLink protocol + fake-context behaviour) with strict type checking (including `noUnusedLocals`). Real-device verification is at the bottom. |
+| 🧪 **Tested** | 205 automated tests (unit + mock-iLink protocol + fake-context behaviour) with strict type checking (including `noUnusedLocals`). Real-device verification is at the bottom. |
 
 ## Quickstart
 
@@ -260,6 +260,18 @@ handled: a crash replays, it does not drop.
 the address and password from `~/.local/state/opencode/service.json` and calls the local
 opencode HTTP API with HTTP Basic.
 
+## Coexistence with other plugins
+
+Multiple opencode plugins on one machine are normal; this plugin takes care not to get in their way:
+
+- **Single-poller lock**: no matter how many project windows are open (each loads a plugin instance), exactly one instance polls WeChat at a time, and the slot is taken over within 2 minutes if the holder wedges.
+- **A human wait is never mistaken for a stall**: while `wechat_ask` waits for an answer it reports tool progress (`session.tool.progress`) every 60 seconds, so stall-recovery plugins ("quiet for 3 minutes → inject continue") leave the wait alone.
+- **`/cancel` stays cancelled**: after you stop a turn, auto-resume-style plugins do not continue it until you speak again.
+- **No stealing other tools**: the `🔧` progress line only announces real work; other plugins' bookkeeping tools (e.g. `task_complete`) never show up in the chat.
+- **Separate state**: the plugin only writes `~/.config/opencode/wechat/` (plus reading opencode's own `service.json`); storage, logs, commands and tool names do not overlap with other plugins.
+
+Verified side by side with: oh-my-opencode-slim, @tarquinen/opencode-dcp, opencode-i18n-v2, auto-resume-v2 (local). If you hit a new conflict, `event type seen for the first time` lines in `bridge.log` usually point at it.
+
 ## Troubleshooting
 
 ```bash
@@ -288,7 +300,7 @@ Logs: `~/.config/opencode/wechat/bridge.log`; `/status` and `/log` work from WeC
 
 ```bash
 cd types && bun install  # one-time: the official types (types/ is gitignored)
-bun test          # 202 tests: unit + mock iLink + fake-context Bridge behaviour
+bun test          # 205 tests: unit + mock iLink + fake-context Bridge behaviour
 bun run typecheck # strict check against the official @opencode/plugin types
 bun verify.ts     # environment self-check
 bun gen-manual.ts # regenerate MANUAL.md after editing manual.ts

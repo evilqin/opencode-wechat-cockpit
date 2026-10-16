@@ -139,6 +139,18 @@ const RECONCILE_INTERVAL_MS = 60_000
 /** Default wait for a burst of approval requests to finish before announcing. */
 const PERMISSION_BURST_MS = 800
 
+/**
+ * Tools that are another plugin's (or our own) bookkeeping, never the user's
+ * work, and must not show up as a "🔧 …" progress line.
+ *
+ * `task_complete` belongs to the auto-resume plugin: its watchdog injects a
+ * "continue" into a stalled session and the model then calls `task_complete`,
+ * so mirroring it would spam the chat with a tool nobody asked for.
+ */
+function isNoisyTool(name: string): boolean {
+  return name.startsWith("wechat_") || name === "task_complete"
+}
+
 /** Turn-local text assembly for one session. */
 interface TurnBuffer {
   conversationId: string
@@ -2544,7 +2556,7 @@ export class Bridge {
         const conversationId = this.#conversationForSession(sessionID)
         if (!conversationId) return
         const name = typeof data.id === "string" ? data.id : "tool"
-        if (name.startsWith("wechat_")) return
+        if (isNoisyTool(name)) return
         const summary = summarizeToolInput(data.input)
         await this.#sendEphemeral(conversationId, `🔧 ${name}${summary ? `: ${summary}` : ""}`)
         return
@@ -2562,7 +2574,7 @@ export class Bridge {
         const conversationId = this.#conversationForSession(sessionID)
         if (!conversationId) return
         const name = typeof data.id === "string" ? data.id : "tool"
-        if (name.startsWith("wechat_")) return
+        if (isNoisyTool(name)) return
         const error = (data.error ?? {}) as { message?: string; type?: string }
         const detail = String(error.message ?? error.type ?? "失败").replace(/\s+/g, " ").slice(0, 140)
         await this.#sendEphemeral(conversationId, `❌ ${name} 失败：${detail}`)
