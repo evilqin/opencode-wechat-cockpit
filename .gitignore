@@ -5,6 +5,9 @@ types/node_modules/
 *.log
 state.json
 lock.json
+login.lock
+*.tmp
+*.corrupt
 qr.png
 config.json
 .env

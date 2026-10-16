@@ -246,10 +246,14 @@ export function assertTrustedUrl(url: string, what: string): URL {
     throw new Error(`${what} 不是合法 URL：${url.slice(0, 120)}`)
   }
   const host = parsed.hostname.toLowerCase()
-  if (host === "localhost" || host === "::1" || /^127\./.test(host)) return parsed
-  if (parsed.protocol !== "https:") {
-    throw new Error(`${what} 必须走 https，已拒绝：${parsed.protocol}//${parsed.host}`)
+  const loopback = host === "localhost" || host === "::1" || /^127\./.test(host)
+  // The scheme check comes first: on Bun `fetch("file://…")` reads local files,
+  // so a loopback host with a `file:` scheme used to slip through and copy
+  // state.json (with the bot token) into the inbox.
+  if (parsed.protocol !== "https:" && !(loopback && parsed.protocol === "http:")) {
+    throw new Error(`${what} 必须走 https（回环测试除外）：${parsed.protocol}//${parsed.host}`)
   }
+  if (loopback) return parsed
   if (!isTrustedHost(host)) {
     throw new Error(`${what} 指向非腾讯域名，已拒绝：${host}`)
   }

@@ -9,10 +9,20 @@ concurrency:
   group: ci-${{ github.ref }}
   cancel-in-progress: true
 
+# The job only reads the repository.
+permissions:
+  contents: read
+
 jobs:
   test:
-    name: 类型检查 + 测试
-    runs-on: ubuntu-latest
+    name: 类型检查 + 测试（${{ matrix.os }}）
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        # Windows matters: path handling, file locking and rename races differ
+        # from Linux, and this plugin writes state files on Windows for real.
+        os: [ubuntu-latest, windows-latest]
     # A hung test or install must not burn the 360-minute default.
     timeout-minutes: 10
     steps:
@@ -38,10 +48,14 @@ jobs:
           WECHAT_STATE_DIR: ${{ runner.temp }}/wechat-test-state
           WECHAT_SERVICE_FILE: ${{ runner.temp }}/wechat-test-state/service.json
         run: |
-          mkdir -p "$WECHAT_STATE_DIR"
+          node -e "require('node:fs').mkdirSync(process.env.WECHAT_STATE_DIR, { recursive: true })"
           bun test
 
+      - name: 文档测试数与代码一致
+        run: node scripts/check-docs.mjs
+
       - name: 手册与代码同源（MANUAL.md 无漂移）
+        shell: bash
         run: |
           bun gen-manual.ts
           # `git diff` alone ignores untracked files, so a PR that deleted

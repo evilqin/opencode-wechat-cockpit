@@ -151,6 +151,12 @@ function isNoisyTool(name: string): boolean {
   return name.startsWith("wechat_") || name === "task_complete"
 }
 
+/** True when a `session.get` failure means the session no longer exists. */
+function isSessionNotFound(error: unknown): boolean {
+  const message = error instanceof Error ? error.message : String(error ?? "")
+  return /(not.?found|404)/i.test(message)
+}
+
 /** Turn-local text assembly for one session. */
 interface TurnBuffer {
   conversationId: string
@@ -481,32 +487,47 @@ export class Bridge {
    * session or a `/switch` left an entry behind for the life of the process.
    */
   #pruneConversationState(): void {
-    const live = new Set(Object.keys(this.#state.bindings))
-    if (this.#state.lastConversation) live.add(this.#state.lastConversation)
-    const maps: Array<Map<string, unknown>> = [
-      this.#typingTickets,
-      this.#typingTimers,
-      this.#typingSessions,
-      this.#sendChains,
-      this.#lastListing,
-      this.#lastFlushedAt,
-      this.#queueGenerations,
-    ]
-    for (const map of maps) {
+    const conversations = new Set(Object.keys(this.#state.bindings))
+    if (this.#state.lastConversation) conversations.add(this.#state.lastConversation)
+    // Each map is keyed differently — conversation ids, session ids (turn
+    // signals and the typing indicator), peer ids (typing tickets) — and
+    // pruning them all against one key space silently wiped live state every
+    // hour.
+    const sessions = new Set<string>()
+    for (const binding of Object.values(this.#state.bindings)) {
+      if (binding.sessionID) sessions.add(binding.sessionID)
+    }
+    if (this.#state.channelSessionID) sessions.add(this.#state.channelSessionID)
+    const peers = new Set<string>()
+    for (const conversationId of conversations) {
+      const peerId = conversationId.split(":").pop()
+      if (peerId) peers.add(peerId)
+    }
+    const prune = (map: Map<string, unknown>, alive: Set<string>): void => {
       for (const key of [...map.keys()]) {
-        if (!live.has(key)) map.delete(key)
+        if (!alive.has(key)) map.delete(key)
       }
     }
+    prune(this.#typingTickets, peers)
+    prune(this.#typingTimers, conversations)
+    prune(this.#sendChains, conversations)
+    prune(this.#lastListing, conversations)
+    prune(this.#lastFlushedAt, conversations)
+    prune(this.#queueGenerations, conversations)
+    prune(this.#followed, conversations)
+    for (const sessionID of [...this.#typingSessions.keys()]) {
+      if (!sessions.has(sessionID)) this.#typingSessions.delete(sessionID)
+    }
     for (const sessionID of [...this.#settledTurns]) {
-      if (!live.has(sessionID)) this.#settledTurns.delete(sessionID)
+      if (!sessions.has(sessionID)) this.#settledTurns.delete(sessionID)
     }
     for (const sessionID of [...this.#steppedTurns]) {
-      if (!live.has(sessionID)) this.#steppedTurns.delete(sessionID)
+      if (!sessions.has(sessionID)) this.#steppedTurns.delete(sessionID)
     }
     // Approval/form records belong to a session; a conversation that is gone
     // cannot answer them.
-    this.#pendingPermissions = this.#pendingPermissions.filter((item) => live.has(item.conversationId))
-    this.#pendingForms = this.#pendingForms.filter((item) => live.has(item.conversationId))
+    this.#pendingPermissions = this.#pendingPermissions.filter((item) => conversations.has(item.conversationId))
+    this.#pendingForms = this.#pendingForms.filter((item) => conversations.has(item.conversationId))
   }
 
   /**
@@ -564,6 +585,9 @@ export class Bridge {
         action: typeof request.action === "string" ? request.action : "?",
         resources: Array.isArray(request.resources) ? request.resources.map(String) : [],
         createdAt: Date.now(),
+        // The prompt goes out right below: mark it announced, or a burst timer
+        // that is still pending could announce the same request twice.
+        announced: true,
       }
       this.#pendingPermissions.push(pending)
       const queue = this.#pendingPermissions.filter((item) => item.conversationId === conversationId)
@@ -578,7 +602,18 @@ export class Bridge {
     // `permission.reply` fails — and they keep occupying an index, so a genuine
     // new approval behind them looked unanswerable.
     for (const item of [...this.#pendingPermissions]) {
-      const session = await this.#ctx.session.get({ sessionID: item.sessionID }).catch(() => undefined)
+      let session: unknown
+      try {
+        session = await this.#ctx.session.get({ sessionID: item.sessionID })
+      } catch (error) {
+        if (!isSessionNotFound(error)) {
+          // A busy local API is not a deleted session: keep the approval.
+          this.#log.warn(`could not check the session for approval ${item.requestID}: ${errorText(error)}`)
+          continue
+        }
+        // The session really is gone: fall through to the removal below.
+        session = undefined
+      }
       if (session) continue
       this.#pendingPermissions = this.#pendingPermissions.filter((entry) => entry !== item)
       this.#log.info(`dropped approval ${item.requestID}: its session no longer exists`)
@@ -792,6 +827,14 @@ export class Bridge {
       return
     }
 
+    // The allow-list runs before anything is persisted: a stranger's message
+    // must not move `lastConversation` (proactive tools send there) nor consume
+    // the dedupe window.
+    if (!this.#isAllowed(message.peerId)) {
+      this.#log.warn(`ignored message from ${message.peerId}: not in allowedUsers`)
+      return
+    }
+
     this.#state = updateState((state) => {
       if (message.contextToken) state.contextTokens[conversationId] = message.contextToken
       state.lastConversation = conversationId
@@ -799,11 +842,6 @@ export class Bridge {
         state.seenMessages = [...(state.seenMessages ?? []), message.messageId].slice(-SEEN_MESSAGE_LIMIT)
       }
     })
-
-    if (!this.#isAllowed(message.peerId)) {
-      this.#log.warn(`ignored message from ${message.peerId}: not in allowedUsers`)
-      return
-    }
 
     // A fresh inbound message reopens the reply window: retry anything the
     // service refused while the conversation was quiet.
@@ -819,8 +857,13 @@ export class Bridge {
 
     const attachments: { uri: string; name: string }[] = []
     const notes: string[] = []
+    const mediaAccount = this.#state.account
     for (const item of message.media ?? []) {
-      const result = await downloadItem({ account: this.#state.account!, item })
+      if (!mediaAccount) {
+        notes.push("[有附件但微信通道未登录，先跳过下载]")
+        break
+      }
+      const result = await downloadItem({ account: mediaAccount, item })
       if (result.media) {
         attachments.push({ uri: pathToFileURL(result.media.path).href, name: result.media.name })
         // Voice is the one kind the bridge cannot read: it arrives as .silk with
@@ -1074,7 +1117,18 @@ export class Bridge {
   async #ensureSession(conversationId: string, firstText?: string): Promise<string> {
     const binding = this.#state.bindings[conversationId]
     if (binding) {
-      const existing = await this.#ctx.session.get({ sessionID: binding.sessionID }).catch(() => undefined)
+      let existing: unknown
+      try {
+        existing = await this.#ctx.session.get({ sessionID: binding.sessionID })
+      } catch (error) {
+        // Only a definite not-found may rebind the conversation: a busy or
+        // timing-out API must not strand it by switching sessions.
+        if (!isSessionNotFound(error)) {
+          this.#log.warn(`could not check bound session ${binding.sessionID}: ${errorText(error)}`)
+          return binding.sessionID
+        }
+        // Not found: the session really is gone — fall through to the fallback.
+      }
       if (existing) {
         await this.#maybeAutoTitle(conversationId, binding, firstText)
         // Adopt whatever the phone has been using as its home channel, so an
@@ -1112,7 +1166,18 @@ export class Bridge {
   > {
     const stored = this.#state.channelSessionID
     if (stored) {
-      const existing = await this.#ctx.session.get({ sessionID: stored }).catch(() => undefined)
+      let existing: unknown
+      try {
+        existing = await this.#ctx.session.get({ sessionID: stored })
+      } catch (error) {
+        // Same rule as the binding above: never re-create the home channel over
+        // a transient API failure — but a real not-found must fall through to
+        // the recreate path.
+        if (!isSessionNotFound(error)) {
+          this.#log.warn(`could not check channel session ${stored}: ${errorText(error)}`)
+          return { id: stored }
+        }
+      }
       if (existing) return existing as unknown as { id: string; title?: string; location?: { directory?: string } }
       this.#log.warn(`channel session ${stored} is gone; a new one will be created`)
       this.#state = updateState((state) => {
@@ -1578,8 +1643,12 @@ export class Bridge {
     const index = Number.parseInt(value, 10)
     if (Number.isFinite(index) && String(index) === value && remembered) {
       const id = remembered[index - 1]
-      const found = id ? sessions.find((session) => session.id === id) : undefined
-      if (found) return found
+      if (id) {
+        // A remembered index that no longer resolves must not silently fall
+        // back to the full list: the user picked a row they saw, and binding
+        // whatever now sits at that position is worse than "not found".
+        return sessions.find((session) => session.id === id)
+      }
     }
     return resolveSessionTarget(sessions, value)
   }
@@ -2241,7 +2310,7 @@ export class Bridge {
       `网络：${this.#describeNetwork()}`,
       `默认目录：${this.#defaultDirectory()}`,
       `进度提示：${this.#config.progress === "tools" ? "显示工具调用" : "关闭"}`,
-      `回复延迟：文本结束后最多等 ${this.#config.turnGraceMs} 毫秒（grace）`,
+      `回复延迟：文本结束后最多等 ${this.#config.turnGraceMs} 毫秒（grace），收到结束信号后 ${Math.min(this.#config.turnSettleMs, this.#config.turnGraceMs)} 毫秒（settle）`,
       `实时推送：${this.#config.stream === "live" ? `开（每 ${Math.round(this.#config.streamIntervalMs / 1000)}s）` : "关"}`,
       `待审批：${this.#pendingPermissions.length}　待回答：${this.#pendingForms.length}`,
       `待发消息：${this.#queueFor(this.#state.lastConversation ?? "").length}`,
@@ -2363,11 +2432,23 @@ export class Bridge {
       return
     }
     this.#pendingPermissions.push(request)
-    while (this.#pendingPermissions.length > MAX_PENDING_PERMISSIONS) {
-      const dropped = this.#pendingPermissions.shift()
+    // The cap is per conversation (permissions.ts documents it that way): a
+    // burst in one chat used to shift another chat's pending request out of
+    // the list, where its next digit either did nothing or hit a neighbour.
+    const mine = this.#pendingPermissions.filter((item) => item.conversationId === request.conversationId)
+    if (mine.length > MAX_PENDING_PERMISSIONS) {
+      const dropped = mine[0]
       if (dropped) {
-        // Dropping shifts every index, so it must never be silent.
-        this.#log.warn(`too many pending approvals (${MAX_PENDING_PERMISSIONS}); dropped the oldest (${dropped.requestID})`)
+        this.#pendingPermissions = this.#pendingPermissions.filter((item) => item !== dropped)
+        // Dropping shifts every index in this conversation, so it must never
+        // be silent.
+        this.#log.warn(
+          `too many pending approvals in one conversation (${MAX_PENDING_PERMISSIONS}); dropped the oldest (${dropped.requestID})`,
+        )
+        await this.#send(
+          request.conversationId,
+          `⚠️ 待审批太多了，最早的一条（${describeAction(dropped.action)}）已被移出列表，请尽快处理剩下的。`,
+        )
       }
     }
 
@@ -2710,12 +2791,16 @@ export class Bridge {
    * turns out to continue.
    */
   async #finishTurnSoon(sessionID: string, trigger: "idle" | "step"): Promise<void> {
-    if (trigger === "idle") this.#settledTurns.add(sessionID)
-    else this.#steppedTurns.add(sessionID)
     const settle = Math.max(0, Math.min(this.#config.turnSettleMs, this.#config.turnGraceMs))
     const turn = this.#turns.get(sessionID)
     const live = this.#live.get(sessionID)
+    // Only record the signal once a buffer exists: an idle for a text-less turn
+    // (a pure tool turn) used to leave the flag behind, and the *next* turn's
+    // first block was then flushed after the short settle instead of the full
+    // grace, splitting one answer into two messages.
     if (!turn && !live) return
+    if (trigger === "idle") this.#settledTurns.add(sessionID)
+    else this.#steppedTurns.add(sessionID)
     if (settle <= 0) {
       // Nothing to wait for: flush now, and let the caller await it.
       await this.#finishTurn(sessionID, "idle")
@@ -2752,16 +2837,29 @@ export class Bridge {
     if (!this.#steppedTurns.delete(sessionID)) return
     if (this.#settledTurns.has(sessionID)) return
     const turn = this.#turns.get(sessionID)
-    if (!turn?.timer) return
-    clearTimeout(turn.timer)
-    turn.timer = setTimeout(
-      () =>
-        void this.#finishTurn(sessionID, "timer").catch((error) =>
-          this.#log.warn(`turn flush failed: ${errorText(error)}`),
-        ),
-      this.#config.turnGraceMs,
-    )
-    turn.timer.unref?.()
+    if (turn?.timer) {
+      clearTimeout(turn.timer)
+      turn.timer = setTimeout(
+        () =>
+          void this.#finishTurn(sessionID, "timer").catch((error) =>
+            this.#log.warn(`turn flush failed: ${errorText(error)}`),
+          ),
+        this.#config.turnGraceMs,
+      )
+      turn.timer.unref?.()
+      return
+    }
+    // Live mode: the step-end hint replaced the fragment interval with a
+    // one-shot settle, so a live-only turn needs its interval back — otherwise
+    // the partial answer is flushed early and the rest arrives as a second
+    // message.
+    const live = this.#live.get(sessionID)
+    if (!live?.timer) return
+    clearInterval(live.timer)
+    live.timer = setInterval(() => {
+      void this.#flushLive(sessionID).catch((error) => this.#log.warn(`live flush failed: ${errorText(error)}`))
+    }, this.#config.streamIntervalMs)
+    live.timer.unref?.()
   }
 
   /** A turn ended: deliver whatever is left and stop the "typing" indicator. */
@@ -2782,7 +2880,10 @@ export class Bridge {
 
     await this.#setTyping(conversationId, false)
 
-    if (live && live.sent > 0) {
+    // `sent > 0` alone misses the "first fragment is in flight" case: the
+    // awaited send has taken it out of `pending` but not yet counted it, so
+    // falling through would send the whole turn a second time.
+    if (live && (live.sent > 0 || live.sending !== undefined)) {
       if (live.degraded) {
         // A streamed fragment was dropped, so the tail alone would be a
         // fragment: send the whole assembled turn instead.
@@ -3299,7 +3400,11 @@ export class Bridge {
         // Persist the remainder *before* sending: a crash or a reload mid-flush
         // then loses at most the in-flight item — and that one carries a stable
         // client id, so even a delivered-but-unacknowledged retry is deduped.
-        this.#setQueue(conversationId, batch.slice(index + 1))
+        // Merge — never overwrite: `batch` is a snapshot, and anything enqueued
+        // while an earlier item was being sent must survive this write.
+        const rest = batch.slice(index + 1)
+        const fresh = this.#queueFor(conversationId).filter((queued) => !batch.includes(queued))
+        this.#setQueue(conversationId, [...rest, ...fresh])
         const refused = await this.#chain(conversationId, () =>
           this.#trySend(conversationId, item.text, item.clientId),
         )
@@ -3332,7 +3437,10 @@ export class Bridge {
     if ((this.#queueGenerations.get(conversationId) ?? 0) !== generation) return
 
     const appended = this.#queueFor(conversationId)
-    const merged = [...batch.slice(refusedAt), ...appended]
+    // The tail after the refused item was already re-persisted inside the loop
+    // (and so were messages enqueued while we were sending); only the refused
+    // item itself still has to go back.
+    const merged = [batch[refusedAt], ...appended]
     if (merged.length > QUEUE_LIMIT) {
       // Never silent: the dropped items are the oldest, which may be the very
       // tail this flush was trying to deliver.

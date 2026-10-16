@@ -15,7 +15,7 @@ import { LocalApi } from "./api.ts"
 import { Bridge, errorText, renderForWechat } from "./bridge.ts"
 import { kindForPath, type OutboundKind } from "./media.ts"
 import { readConfig, writeConfig, type WechatConfig } from "./config.ts"
-import { acquireLoginLock, ensureStateDir, removeQrPng, STATE_DIR } from "./state.ts"
+import { acquireLoginLock, ensureStateDir, QR_PNG_PATH, removeQrPng, STATE_DIR } from "./state.ts"
 import { login } from "./ilink.ts"
 
 type Ctx = Parameters<Parameters<typeof Plugin.define>[0]["setup"]>[0]
@@ -189,7 +189,9 @@ export default Plugin.define({
 
     return () => {
       loop.dispose()
-      void bridge.announceStop()
+      // Only the owner tells the backend the bot is going away: a standby
+      // instance unloading must not tear down the live long-poll.
+      if (bridge.ownsPoller) void bridge.announceStop()
       bridge.releaseOwnership()
       log.info("plugin unloaded")
     }
@@ -624,7 +626,10 @@ function describeConfig(config: WechatConfig, directory: string): string {
 
 /** Write a scannable PNG next to the state file. Returns the path, or undefined. */
 async function writeQrPng(payload: string): Promise<string | undefined> {
-  const target = join(STATE_DIR, "qr.png")
+  // QR_PNG_PATH honours WECHAT_QR_PNG, which the login flow and the pruner use
+  // too: hardcoding the name here wrote the code to a path the cleanup never
+  // looked at.
+  const target = QR_PNG_PATH
   try {
     const mod = (await import("qrcode")) as unknown as {
       default?: { toFile: (p: string, t: string, o?: unknown) => Promise<void> }

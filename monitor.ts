@@ -172,6 +172,16 @@ export class ChannelMonitor {
         continue
       }
 
+      // A well-formed response is an object; a null/scalar body (a proxy or a
+      // captive portal answering with garbage) must not throw a TypeError out
+      // of the loop, or the poller silently dies.
+      if (typeof response !== "object" || response === null) {
+        this.#consecutiveFailures += 1
+        this.#options.onError?.(new Error("getupdates 返回的不是对象，已按协议错误处理"))
+        await sleep(this.#failureDelay(), signal)
+        continue
+      }
+
       const suggested = response.longpolling_timeout_ms
       if (typeof suggested === "number" && suggested > 0) {
         this.#longPollTimeoutMs = clampPollTimeout(suggested)

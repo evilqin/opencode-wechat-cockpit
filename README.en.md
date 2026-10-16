@@ -110,7 +110,8 @@ into that session.
 
 ```bash
 bun ...login-cli.ts --status   # binding, directory, session count
-bun ...login-cli.ts --logout   # wipe local credentials
+bun ...login-cli.ts --logout   # wipe local credentials (keeps the old token so a re-scan rebinds the same bot)
+bun ...login-cli.ts --purge    # forget the old token too (a new scan creates a fresh binding)
 bun ...login-cli.ts --force    # re-scan even when already logged in
 ```
 

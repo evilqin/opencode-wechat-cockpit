@@ -709,7 +709,7 @@ describe("wire hygiene", () => {
     expect(isTrustedUrl("http://localhost:8080/download")).toBe(true)
 
     // The two that motivated this check.
-    expect(isTrustedUrl("file:///C:/Users/qin/.config/opencode/wechat/state.json")).toBe(false)
+    expect(isTrustedUrl("file:///home/user/.config/opencode/wechat/state.json")).toBe(false)
     expect(isTrustedUrl("https://attacker.example/steal")).toBe(false)
     expect(isTrustedUrl("http://ilinkai.weixin.qq.com/downgrade")).toBe(false)
     expect(isTrustedUrl("https://weixin.qq.com.evil.example/steal")).toBe(false)

@@ -563,18 +563,20 @@ describe("inbound messages", () => {
   })
 
   test("an image with no caption is titled by its kind, not by the notice", async () => {
-    const { bridge, calls } = await harness()
-    // Give the phone a session first, so the image lands in a fresh one.
+    const { bridge, calls, sessions } = await harness()
     await bridge.handleInbound(inbound("你好"))
-    clearSent()
-    await bridge.handleInbound(inbound("/new"))
+    // Lend the phone a desktop session, then delete both it and the home
+    // channel: the image now has to create a session of its own, and that one
+    // must be named after its kind (图片) — never after the bridge's own
+    // "[收到附件 …]" note, the bug this test pins down.
+    await bridge.handleInbound(inbound("/attach 1"))
+    sessions.delete("ses_remote1")
+    sessions.delete(String(readState().channelSessionID))
     await bridge.handleInbound({
       ...inbound(""),
       media: [{ type: 2, msg_id: "1", image_item: { media: { full_url: "http://127.0.0.1:1/nope" } } }],
     })
-    // The download fails (nothing listens there), which is fine: the point is
-    // that the session is not named after the bridge's own note.
-    expect(String(calls.prompts.at(-1)?.text)).toContain("[")
+    expect(calls.creates.at(-1)?.title).toBe("图片")
   })
 
   test("attachments are handed to the model as local files", async () => {
