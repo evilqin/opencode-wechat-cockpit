@@ -1,0 +1,160 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>opencode-wechat-cockpit · 把微信变成 opencode 的驾驶舱</title>
+<meta name="description" content="用手机微信遥控本机 opencode：会话、审批、提问、附件、主动推送。单轮询器自愈，206 个自动化测试。">
+<style>
+  :root {
+    --bg: #0b0f14; --panel: #11161d; --panel-2: #161d26; --border: #232d3a;
+    --text: #e8eef6; --muted: #93a4b8; --green: #3fd68c; --blue: #6ca0ff; --amber: #ffc46b;
+    --mono: "Cascadia Code", "JetBrains Mono", Consolas, "SF Mono", monospace;
+  }
+  * { box-sizing: border-box; }
+  body { margin: 0; background: var(--bg); color: var(--text); font: 16px/1.65 "Segoe UI", "PingFang SC", "Microsoft YaHei", system-ui, sans-serif; }
+  a { color: var(--blue); text-decoration: none; }
+  a:hover { text-decoration: underline; }
+  .wrap { max-width: 1040px; margin: 0 auto; padding: 0 24px; }
+  header.hero { padding: 64px 0 28px; }
+  .badges { display: flex; gap: 8px; flex-wrap: wrap; margin-bottom: 18px; }
+  .badge { font-size: 12px; padding: 3px 10px; border-radius: 999px; border: 1px solid var(--border); color: var(--muted); background: var(--panel); }
+  .badge.ok { color: var(--green); border-color: #2a553e; }
+  h1 { font-size: 42px; line-height: 1.25; margin: 0 0 14px; letter-spacing: -0.5px; }
+  h1 .accent { color: var(--green); }
+  .sub { color: var(--muted); font-size: 18px; max-width: 720px; margin: 0 0 26px; }
+  .cta { display: flex; gap: 12px; flex-wrap: wrap; }
+  .btn { display: inline-flex; align-items: center; gap: 8px; padding: 12px 22px; border-radius: 10px; font-weight: 600; border: 1px solid var(--border); background: var(--panel); color: var(--text); }
+  .btn:hover { text-decoration: none; border-color: #33455c; }
+  .btn.primary { background: linear-gradient(135deg, #2fae74, #3fd68c); color: #04110a; border: none; }
+  .btn.ghost { background: transparent; }
+  section { padding: 34px 0; }
+  h2 { font-size: 24px; margin: 0 0 8px; }
+  .lead { color: var(--muted); margin: 0 0 22px; }
+  .stats { display: grid; grid-template-columns: repeat(auto-fit, minmax(150px, 1fr)); gap: 12px; }
+  .stat { background: var(--panel); border: 1px solid var(--border); border-radius: 12px; padding: 14px 16px; }
+  .stat .v { font-size: 26px; font-weight: 700; font-family: var(--mono); }
+  .stat .k { color: var(--muted); font-size: 13px; }
+  .stat .v.green { color: var(--green); }
+  .stat .v.blue { color: var(--blue); }
+  .grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(290px, 1fr)); gap: 14px; }
+  .card { background: var(--panel); border: 1px solid var(--border); border-radius: 14px; padding: 18px; }
+  .card h3 { margin: 0 0 8px; font-size: 17px; }
+  .card p { margin: 0; color: var(--muted); font-size: 14.5px; }
+  .card .ico { font-size: 22px; display: block; margin-bottom: 10px; }
+  .steps { display: grid; grid-template-columns: repeat(auto-fit, minmax(240px, 1fr)); gap: 14px; counter-reset: step; }
+  .step { background: var(--panel-2); border: 1px solid var(--border); border-radius: 14px; padding: 18px; position: relative; }
+  .step::before { counter-increment: step; content: "第 " counter(step) " 步"; display: block; font-size: 12px; color: var(--green); letter-spacing: 1px; margin-bottom: 8px; }
+  .step h3 { margin: 0 0 6px; font-size: 16px; }
+  .step p { margin: 0; color: var(--muted); font-size: 14px; }
+  pre { background: #0d1219; border: 1px solid var(--border); border-radius: 12px; padding: 16px 18px; overflow-x: auto; font-family: var(--mono); font-size: 13.5px; line-height: 1.7; }
+  code { font-family: var(--mono); font-size: 0.92em; background: #1a2331; padding: 1px 6px; border-radius: 6px; }
+  pre code { background: none; padding: 0; }
+  .faq dt { font-weight: 600; margin-top: 16px; }
+  .faq dd { margin: 6px 0 0; color: var(--muted); }
+  footer { border-top: 1px solid var(--border); margin-top: 40px; padding: 26px 0 40px; color: var(--muted); font-size: 14px; display: flex; justify-content: space-between; gap: 16px; flex-wrap: wrap; }
+  .starline { color: var(--amber); }
+  .errorline { display: none; color: var(--muted); font-size: 13px; }
+  .muted { color: var(--muted); }
+</style>
+</head>
+<body>
+<div class="wrap">
+  <header class="hero">
+    <div class="badges">
+      <span class="badge ok">✅ CI 双平台全绿（Windows / Ubuntu）</span>
+      <span class="badge">🧪 206 个自动化测试</span>
+      <span class="badge">📄 MIT</span>
+      <span class="badge">🔌 opencode v2 插件</span>
+    </div>
+    <h1>把微信变成 opencode 的<br><span class="accent">驾驶舱</span></h1>
+    <p class="sub">
+      出门在外、躺在床上、会议上——不用打开电脑，手机微信里就能看 agent 在干什么、
+      批准它执行命令、回答它的问题、收它主动发来的文件。本机长轮询，无需公网 IP。
+    </p>
+    <div class="cta">
+      <a class="btn primary" href="https://github.com/evilqin/opencode-wechat-cockpit" target="_blank" rel="noopener">⭐ GitHub 上看看</a>
+      <a class="btn" href="#start">🚀 三步上手</a>
+      <a class="btn ghost" href="https://github.com/evilqin/opencode-wechat-cockpit/releases/tag/v1.9.0" target="_blank" rel="noopener">⬇ 下载 v1.9.0</a>
+    </div>
+  </header>
+
+  <section>
+    <h2>项目实时数据</h2>
+    <p class="lead">直接读取 GitHub API，不是写死的数字。</p>
+    <div class="stats" id="stats">
+      <div class="stat"><div class="v green" id="s-stars">–</div><div class="k">Stars</div></div>
+      <div class="stat"><div class="v blue" id="s-forks">–</div><div class="k">Forks</div></div>
+      <div class="stat"><div class="v" id="s-releases">–</div><div class="k">Releases</div></div>
+      <div class="stat"><div class="v" id="s-clones">–</div><div class="k">14 天克隆（GitHub 统计）</div></div>
+      <div class="stat"><div class="v" id="s-updated">–</div><div class="k">最近更新</div></div>
+    </div>
+    <p class="errorline" id="stats-error">（本页在本地预览时显示实时数据；托管在静态空间时会自动隐藏这块。）</p>
+  </section>
+
+  <section>
+    <h2>它和别的「微信桥」不一样在哪</h2>
+    <p class="lead">不是 demo 级脚本，是按「它会替我管电脑」的标准写的。</p>
+    <div class="grid">
+      <div class="card"><span class="ico">🛂</span><h3>审批直达手机</h3><p>agent 要执行命令被桌面端卡住？微信里收提示，回 <code>1</code>、<code>/allow always</code> 或 <code>/deny</code> 就放行或拒绝，不用回电脑前。</p></div>
+      <div class="card"><span class="ico">❓</span><h3>提问直达手机</h3><p>内置 <code>wechat_ask</code> 工具：agent 需要人拍板时直接问你，微信里作答即返回结果；等待期间自动保活，不会被「假死恢复」插件误打断。</p></div>
+      <div class="card"><span class="ico">🏠</span><h3>手机会话有「家」</h3><p><code>/new</code>、<code>/list</code>、<code>/attach</code>、<code>/switch</code>：每个微信对话框对应一个会话，主会话永久保留，切换有明确回执。</p></div>
+      <div class="card"><span class="ico">📬</span><h3>消息乱序也不丢</h3><p>发送带稳定 client_id（幂等重试不重发）、队列逐条落盘、回复窗口关了就先排队、半截回答自动编号补发（1/3、2/3…）。</p></div>
+      <div class="card"><span class="ico">🔒</span><h3>单轮询器 + 自愈</h3><p>多个 opencode 窗口也只跑一个轮询；带锁心跳、卡死自动接管、网络看门狗（长轮询丢包自动退避重连）；卸载时只有锁持有者宣告下线。</p></div>
+      <div class="card"><span class="ico">🧪</span><h3>工程级可靠性</h3><p>206 个自动化测试 + strict typecheck，CI 在 Windows 与 Ubuntu 双平台全绿。真机跑了几个月的 bug 都是「审计找出来的」，不是用户踩出来的。</p></div>
+    </div>
+  </section>
+
+  <section id="start">
+    <h2>三步上手</h2>
+    <p class="lead">前提：本机已装 <a href="https://opencode.ai" target="_blank" rel="noopener">opencode</a>，且手机微信能扫码登录。</p>
+    <div class="steps">
+      <div class="step"><h3>克隆到插件目录</h3><p>放进 opencode 的插件目录，重启后自动加载。</p></div>
+      <div class="step"><h3>装两个二维码依赖</h3><p>登录二维码靠它们渲染，一次性安装。</p></div>
+      <div class="step"><h3>扫码登录</h3><p>会话里敲 <code>/wechat-login</code>，手机微信扫码，然后给这个 bot 发消息即可。</p></div>
+    </div>
+    <pre><code>git clone https://github.com/evilqin/opencode-wechat-cockpit ~/.config/opencode/plugins/wechat
+cd ~/.config/opencode/plugins/wechat &amp;&amp; bun add qrcode qrcode-terminal
+# 然后在 opencode 会话里输入：
+/wechat-login</code></pre>
+  </section>
+
+  <section>
+    <h2>常见疑问</h2>
+    <dl class="faq">
+      <dt>安全吗？凭据存哪？</dt>
+      <dd>凭据只写本机状态文件（POSIX 0600；Windows 走用户目录 ACL），随代码一起开源、随时可审。网络出口只允许 https 且域名白名单（连 <code>file://</code> 回环都会被拒绝）。</dd>
+      <dt>需要公网 IP / 内网穿透吗？</dt>
+      <dd>不需要。本机主动长轮询腾讯 iLink 网关，家宽 / 校园网 / 公司网都能用。</dd>
+      <dt>会封号吗？</dt>
+      <dd>底层是微信 iLink 接口的非官方用法，风险自担。请只绑定自己的号、用于遥控自己的电脑，不要用于群发、营销等滥用场景——这也是此项目刻意不做「批量操作」的原因。</dd>
+      <dt>和那一堆「wechat 机器人」比呢？</dt>
+      <dd>那些多是通用聊天机器人；这个项目的定位是 <b>opencode 的远程驾驶舱</b>：审批、提问、会话切换、工具进度、可靠性（幂等/队列/锁/自愈）都是围绕 coding agent 设计的。</dd>
+    </dl>
+  </section>
+
+  <footer>
+    <div>MIT License · <a href="https://github.com/evilqin/opencode-wechat-cockpit" target="_blank" rel="noopener">evilqin/opencode-wechat-cockpit</a></div>
+    <div class="starline">如果它对你的工作流有用，去点个 ⭐ 是最好的支持。</div>
+  </footer>
+</div>
+
+<script>
+(async () => {
+  const fmt = (n) => (typeof n === "number" ? n.toLocaleString("zh-CN") : "–");
+  try {
+    const res = await fetch("/api/stats", { cache: "no-store" });
+    if (!res.ok) throw new Error("api unavailable");
+    const s = await res.json();
+    document.getElementById("s-stars").textContent = fmt(s.stars);
+    document.getElementById("s-forks").textContent = fmt(s.forks);
+    document.getElementById("s-releases").textContent = fmt(s.releasesCount);
+    document.getElementById("s-clones").textContent = s.clones14d ? fmt(s.clones14d.total) : "–";
+    document.getElementById("s-updated").textContent = s.pushedAt ? new Date(s.pushedAt).toLocaleDateString("zh-CN") : "–";
+  } catch {
+    document.getElementById("stats-error").style.display = "block";
+  }
+})();
+</script>
+</body>
+</html>
